@@ -1,0 +1,8 @@
+[project]
+name = "smart-litter-vision-dataset-server"
+version = "0.1.0"
+description = "Local image collector for the archived smart litter cabinet vision experiment"
+requires-python = ">=3.9"
+dependencies = [
+  "Flask==3.1.2",
+]
