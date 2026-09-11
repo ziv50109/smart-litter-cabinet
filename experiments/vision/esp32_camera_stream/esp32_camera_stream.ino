@@ -314,8 +314,8 @@ void setup() {
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
@@ -323,7 +323,8 @@ void setup() {
 
   // 除錯用：確認 PSRAM 是否真的被偵測到
   Serial.printf("PSRAM 是否偵測到: %s\n", psramFound() ? "是" : "否");
-  Serial.printf("PSRAM 可用大小: %d bytes\n", ESP.getPsramSize());
+  Serial.printf("PSRAM 可用大小: %lu bytes\n",
+                static_cast<unsigned long>(ESP.getPsramSize()));
 
   // 如果有 PSRAM，用中等畫質（QSPI PSRAM 頻寬有限，VGA+雙緩衝會導致 FB-OVF 溢出當機）
   if (psramFound() && ESP.getPsramSize() > 0) {

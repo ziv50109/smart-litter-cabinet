@@ -32,6 +32,12 @@ function finiteNumber_(value, name, min, max) {
   return value;
 }
 
+function integer_(value, name, min, max) {
+  const number = finiteNumber_(value, name, min, max);
+  if (!Number.isInteger(number)) throw new Error('invalid_' + name);
+  return number;
+}
+
 function isoTime_(value, name) {
   if (value === '') return '';
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) {
@@ -64,7 +70,7 @@ function validate_(session) {
   const enterTime = isoTime_(session.enter_time, 'enter_time');
   const exitTime = isoTime_(session.exit_time, 'exit_time');
   if ((enterTime === '') !== (exitTime === '')) throw new Error('invalid_time_pair');
-  const durationSec = finiteNumber_(session.duration_sec, 'duration_sec', 0, 86400);
+  const durationSec = integer_(session.duration_sec, 'duration_sec', 0, 86400);
   if (enterTime !== '') {
     const deltaSec = (Date.parse(exitTime) - Date.parse(enterTime)) / 1000;
     if (deltaSec < 0 || Math.abs(durationSec - deltaSec) > 2) {
@@ -78,16 +84,31 @@ function validate_(session) {
     enter_time: enterTime,
     exit_time: exitTime,
     duration_sec: durationSec,
-    min_distance_mm: finiteNumber_(session.min_distance_mm, 'min_distance_mm', 0, 8190),
+    min_distance_mm: integer_(session.min_distance_mm, 'min_distance_mm', 0, 8190),
     avg_distance_mm: finiteNumber_(session.avg_distance_mm, 'avg_distance_mm', 0, 8190),
-    sample_count: finiteNumber_(session.sample_count, 'sample_count', 1, 1000000),
+    sample_count: integer_(session.sample_count, 'sample_count', 1, 1000000),
   };
+}
+
+function ensureSheet_(spreadsheetId) {
+  const sheet = SpreadsheetApp.openById(spreadsheetId).getSheets()[0];
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(HEADERS);
+    return sheet;
+  }
+  const actualHeaders = sheet.getRange(1, 1, 1, HEADERS.length).getValues()[0];
+  if (sheet.getLastColumn() !== HEADERS.length ||
+      actualHeaders.some((value, index) => value !== HEADERS[index])) {
+    throw new Error('invalid_sheet_schema');
+  }
+  return sheet;
 }
 
 function doPost(e) {
   try {
     const raw = e && e.postData && e.postData.contents;
-    if (typeof raw !== 'string' || raw.length === 0 || raw.length > MAX_BODY_BYTES) {
+    if (typeof raw !== 'string' || raw.length === 0 || raw.length > MAX_BODY_BYTES ||
+        Utilities.newBlob(raw).getBytes().length > MAX_BODY_BYTES) {
       return jsonResponse_({ok: false, error: 'invalid_request'});
     }
     let body;
@@ -116,8 +137,7 @@ function doPost(e) {
     const lock = LockService.getScriptLock();
     if (!lock.tryLock(10000)) return jsonResponse_({ok: false, error: 'busy'});
     try {
-      const sheet = SpreadsheetApp.openById(spreadsheetId).getSheets()[0];
-      if (sheet.getLastRow() === 0) sheet.appendRow(HEADERS);
+      const sheet = ensureSheet_(spreadsheetId);
       const lastRow = sheet.getLastRow();
       if (lastRow > 1) {
         const duplicate = sheet.getRange(2, 1, lastRow - 1, 1)

@@ -8,10 +8,10 @@ The current design uses RFID and ToF. Camera-based recognition is an archived ex
 
 ## Structure
 
-- `firmware/main/`: main RFID + VL53L0X + Apps Script firmware
+- `firmware/main/`: main RFID + VL53L0X + Apps Script Arduino sketch
 - `firmware/tests/`: isolated hardware validation sketches and records
-- `backend/apps-script/`: Google Sheets receiver
-- `experiments/vision/`: archived camera capture workflow, local Flask collector, and Edge Impulse model
+- `backend/`: Google Sheets Apps Script receiver
+- `experiments/vision/`: archived camera capture workflow, local Flask collector, and Edge Impulse model; its Arduino sketch is under `esp32_camera_stream/`
 
 Local engineering notes are kept under the ignored `docs/` directory and are not part of the published repository.
 
@@ -21,7 +21,7 @@ Sensitive configuration is injected locally: `secrets.example.h` defines the int
 
 ## Status
 
-- Main firmware: organized; hardware compile, wiring validation, and current measurement remain
+- Main firmware: compiles successfully; physical wiring, flashing, and current measurement remain
 - VL53L0X: standalone web distance test is under `firmware/tests/`
 - RFID: validation starts when the reader module arrives
 - Vision: archived and not part of the current MVP

@@ -10,7 +10,7 @@ constexpr uint8_t TOF_SCL_PIN = 6;      // D5 / GPIO6
 constexpr uint8_t RFID_TX_PIN = 43;     // D6 / GPIO43 -> XY RXD
 constexpr uint8_t RFID_RX_PIN = 44;     // D7 / GPIO44 <- XY TXD
 
-constexpr uint16_t ENTRY_THRESHOLD_MM = 150;
+constexpr uint16_t ENTRY_THRESHOLD_MM = 200;
 constexpr uint16_t EXIT_THRESHOLD_MM = 200;
 constexpr uint32_t ENTRY_DEBOUNCE_MS = 300;
 constexpr uint32_t EXIT_DEBOUNCE_MS = 500;

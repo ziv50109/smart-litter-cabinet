@@ -6,13 +6,13 @@
 
 ### 範圍
 
-本模組整合三個相依成果：XIAO ESP32-S3 Sense 相機取像介面、本機 Flask 資料集接收器，以及 Edge Impulse 匯出的 TinyML Arduino 模型。相機程式可透過手機網頁選擇貓咪 label 或 `unknown` 後拍照，再將 JPEG 傳至同一區域網路內的電腦。現有 `camera_stream.ino` 尚未直接整合模型推論；模型 ZIP 保留為可重現的獨立匯出物。
+本模組整合三個相依成果：XIAO ESP32-S3 Sense 相機取像介面、本機 Flask 資料集接收器，以及 Edge Impulse 匯出的 TinyML Arduino 模型。相機程式可透過手機網頁選擇貓咪 label 或 `unknown` 後拍照，再將 JPEG 傳至同一區域網路內的電腦。現有 `esp32_camera_stream.ino` 尚未直接整合模型推論；模型 ZIP 保留為可重現的獨立匯出物。
 
 ### 目錄
 
 ```text
 vision/
-├─ esp32/camera_stream/   # 相機串流、label 選擇與照片上傳
+├─ esp32_camera_stream/   # 相機串流、label 選擇與照片上傳
 ├─ server/                # Python/Flask 本機接收器
 ├─ model/                 # Edge Impulse Arduino library export
 └─ README.md
@@ -43,11 +43,11 @@ py -3.12 -m venv .venv
 .venv\Scripts\python dataset_server.py
 ```
 
-服務預設監聽 `0.0.0.0:5000`。先確認 Windows 防火牆只允許信任的私人網路，再將電腦 LAN IP 寫入本機 `esp32/camera_stream/secrets.h`。此 Flask server 是區網資料收集工具，不應直接暴露到網際網路。
+服務預設監聽 `0.0.0.0:5000`。先確認 Windows 防火牆只允許信任的私人網路，再將電腦 LAN IP 寫入本機 `esp32_camera_stream/secrets.h`。此 Flask server 是區網資料收集工具，不應直接暴露到網際網路。
 
 ### ESP32 設定
 
-1. 將 `esp32/camera_stream/secrets.example.h` 複製為本機 `secrets.h`。
+1. 將 `esp32_camera_stream/secrets.example.h` 複製為同資料夾內的本機 `secrets.h`。
 2. 設定 Wi-Fi、電腦 LAN IP 與連接埠。
 3. Arduino IDE 選擇 XIAO ESP32-S3，先 Verify，再 Upload。
 4. 從 Serial Monitor 取得裝置 IP，以同網段手機開啟頁面並測試三種 labels。
@@ -75,13 +75,13 @@ py -3.12 -m venv .venv
 
 ### Scope
 
-This module groups three related artifacts: the XIAO ESP32-S3 Sense camera interface, the local Flask dataset receiver, and the TinyML Arduino model exported from Edge Impulse. A phone can open the ESP32-hosted page, select a cat label or `unknown`, capture a JPEG, and upload it to a computer on the same LAN. The current `camera_stream.ino` does not yet run model inference directly; the model ZIP is retained as a reproducible standalone export.
+This module groups three related artifacts: the XIAO ESP32-S3 Sense camera interface, the local Flask dataset receiver, and the TinyML Arduino model exported from Edge Impulse. A phone can open the ESP32-hosted page, select a cat label or `unknown`, capture a JPEG, and upload it to a computer on the same LAN. The current `esp32_camera_stream.ino` does not yet run model inference directly; the model ZIP is retained as a reproducible standalone export.
 
 ### Layout
 
 ```text
 vision/
-├─ esp32/camera_stream/   # Camera stream, label selection, and upload
+├─ esp32_camera_stream/   # Camera stream, label selection, and upload
 ├─ server/                # Local Python/Flask receiver
 ├─ model/                 # Edge Impulse Arduino library export
 └─ README.md
@@ -112,11 +112,11 @@ py -3.12 -m venv .venv
 .venv\Scripts\python dataset_server.py
 ```
 
-The service listens on `0.0.0.0:5000` by default. Restrict the Windows Firewall rule to a trusted private network, then place the computer's LAN IP in the local `esp32/camera_stream/secrets.h`. This Flask server is a LAN dataset tool and must not be exposed directly to the Internet.
+The service listens on `0.0.0.0:5000` by default. Restrict the Windows Firewall rule to a trusted private network, then place the computer's LAN IP in the local `esp32_camera_stream/secrets.h`. This Flask server is a LAN dataset tool and must not be exposed directly to the Internet.
 
 ### ESP32 setup
 
-1. Copy `esp32/camera_stream/secrets.example.h` to the local `secrets.h`.
+1. Copy `esp32_camera_stream/secrets.example.h` to a local `secrets.h` in the same directory.
 2. Configure Wi-Fi, the computer LAN IP, and the port.
 3. Select XIAO ESP32-S3 in Arduino IDE, run Verify, then Upload.
 4. Read the device IP from Serial Monitor and test all three labels from a phone on the same network.

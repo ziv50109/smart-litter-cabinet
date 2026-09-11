@@ -64,9 +64,9 @@ uint32_t fnv1a32(const String &text) {
 }
 
 String catNameForChip(const String &chipId) {
-  const uint32_t hash = fnv1a32(chipId);
-  if (CAT_1_CHIP_HASH != 0UL && hash == CAT_1_CHIP_HASH) return CAT_1_NAME;
-  if (CAT_2_CHIP_HASH != 0UL && hash == CAT_2_CHIP_HASH) return CAT_2_NAME;
+  if (CAT_1_CHIP_RAW[0] != '\0' && chipId == CAT_1_CHIP_RAW) return CAT_1_NAME;
+  if (CAT_2_CHIP_RAW[0] != '\0' && chipId == CAT_2_CHIP_RAW) return CAT_2_NAME;
+
   return "unknown";
 }
 
@@ -171,7 +171,10 @@ bool initToF() {
   tof.setTimeout(100);
   tofInitialized = tof.init();
   if (!tofInitialized) return false;
-  tof.setMeasurementTimingBudget(Config::TOF_TIMING_BUDGET_US);
+  if (!tof.setMeasurementTimingBudget(Config::TOF_TIMING_BUDGET_US)) {
+    tofInitialized = false;
+    return false;
+  }
   return true;
 }
 
@@ -326,6 +329,7 @@ bool decodeRecord(const String &encoded, SessionRecord &r) {
     if (i == encoded.length() || encoded[i] == 0x1F) {
       if (++field > 9) return false;
     } else {
+      if (field >= 9) return false;
       fields[field] += encoded[i];
     }
   }
@@ -575,7 +579,7 @@ void processStateMachine() {
         handleInvalidDistance();
       } else {
         invalidDistanceSinceMs = 0;
-        if (d <= Config::ENTRY_THRESHOLD_MM) transitionTo(State::CANDIDATE_ENTRY);
+        if (d < Config::ENTRY_THRESHOLD_MM) transitionTo(State::CANDIDATE_ENTRY);
       }
       break;
     }
@@ -584,7 +588,7 @@ void processStateMachine() {
       if (d == UINT16_MAX) {
         handleInvalidDistance();
         transitionTo(State::IDLE, false);
-      } else if (d >= Config::EXIT_THRESHOLD_MM) {
+      } else if (d >= Config::ENTRY_THRESHOLD_MM) {
         invalidDistanceSinceMs = 0;
         transitionTo(State::IDLE);
       }
@@ -634,7 +638,7 @@ void processStateMachine() {
       const uint16_t d = readDistanceMm();
       if (d == UINT16_MAX) {
         handleInvalidDistance();
-      } else if (d <= Config::ENTRY_THRESHOLD_MM) {
+      } else if (d < Config::EXIT_THRESHOLD_MM) {
         invalidDistanceSinceMs = 0;
         addDistanceSample(d);
         transitionTo(State::OCCUPIED);

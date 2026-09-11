@@ -7,7 +7,7 @@
 #define DEVICE_TOKEN ""
 #define APP_SCRIPT_URL ""
 
-#define CAT_1_CHIP_HASH 0UL
+#define CAT_1_CHIP_RAW ""
 #define CAT_1_NAME "unknown"
-#define CAT_2_CHIP_HASH 0UL
+#define CAT_2_CHIP_RAW ""
 #define CAT_2_NAME "unknown"

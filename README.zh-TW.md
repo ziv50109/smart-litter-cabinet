@@ -8,10 +8,10 @@
 
 ## 目錄
 
-- `firmware/main/`：主系統韌體（RFID + VL53L0X + Apps Script）
+- `firmware/main/`：主系統 Arduino sketch（RFID + VL53L0X + Apps Script）
 - `firmware/tests/`：單一硬體驗證程式與紀錄
-- `backend/apps-script/`：Google Sheets 接收端
-- `experiments/vision/`：已歸檔的 ESP32 拍照流程、本機 Flask 收圖工具與 Edge Impulse 模型
+- `backend/`：Google Sheets Apps Script 接收端
+- `experiments/vision/`：已歸檔的 ESP32 拍照流程、本機 Flask 收圖工具與 Edge Impulse 模型；Arduino sketch 位於 `esp32_camera_stream/`
 
 本機工程紀錄統一放在已忽略的 `docs/`，不屬於公開專案文件。
 
@@ -21,7 +21,7 @@
 
 ## 狀態
 
-- 主韌體：已整理，待實機編譯、佈線與電流量測
+- 主韌體：已編譯通過，待實機佈線、燒錄與電流量測
 - VL53L0X：獨立網頁測距程式已收入 `firmware/tests/`
 - RFID：等待模組到貨後依測試清單驗證
 - Vision：歸檔，現階段不繼續開發
