@@ -10,9 +10,7 @@ datasets/
 *.jpg
 *.jpeg
 *.png
-
-# Local engineering notes (not project documentation)
-/docs/
+!hardware/xy134-wiring.png
 
 # Arduino / PlatformIO output
 build/

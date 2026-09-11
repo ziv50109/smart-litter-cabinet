@@ -76,7 +76,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
   <div>
     <span id="distance" class="distance">--</span>
-    <span class="unit">mm</span>
+    <span class="unit">毫米</span>
   </div>
 
   <div id="status" class="status">
@@ -84,7 +84,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   </div>
 
   <div class="small">
-    每 500ms 自動更新
+    每 500 毫秒自動更新
   </div>
 </div>
 
@@ -99,7 +99,7 @@ async function updateDistance() {
 
     if (data.timeout) {
       distanceEl.textContent = '--';
-      statusEl.textContent = '感測器 Timeout';
+      statusEl.textContent = '感測器讀取逾時';
       return;
     }
 

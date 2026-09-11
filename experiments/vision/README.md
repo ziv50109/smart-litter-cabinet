@@ -1,8 +1,6 @@
-# Vision / TinyML experiment
+# 影像／TinyML 實驗
 
-> Status: archived experiment. The production path uses RFID for identity and VL53L0X for visit detection. This module remains reproducible for future evaluation.
-
-## 中文
+> 狀態：已歸檔。正式系統使用 RFID 辨識身分、VL53L0X 偵測停留；本模組保留供日後重現與評估。
 
 ### 範圍
 
@@ -71,7 +69,9 @@ py -3.12 -m venv .venv
 
 ---
 
-## English
+# Vision / TinyML experiment
+
+> Status: archived. The production system uses RFID for identity and VL53L0X for visit detection; this module remains reproducible for future evaluation.
 
 ### Scope
 

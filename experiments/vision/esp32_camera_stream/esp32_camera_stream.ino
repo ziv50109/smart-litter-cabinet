@@ -39,7 +39,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Cat Dataset Capture</title>
+  <title>貓咪資料集拍攝</title>
   <style>
     body { background:#111; color:#eee; font-family:sans-serif; text-align:center; margin:0; padding:16px; }
     img { max-width:100%; border:2px solid #444; margin-top:12px; border-radius:8px; }
@@ -55,13 +55,13 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
   </style>
 </head>
 <body>
-  <h2>🐱 Cat Dataset Capture</h2>
+  <h2>貓咪資料集拍攝</h2>
   <img src="/stream">
 
   <div class="labels">
     <button class="label-btn" onclick="capture('翎角')">翎角</button>
     <button class="label-btn" onclick="capture('麻嚕')">麻嚕</button>
-    <button class="label-btn" onclick="capture('unknown')">unknown</button>
+    <button class="label-btn" onclick="capture('unknown')">未知</button>
   </div>
 
   <div id="status"></div>

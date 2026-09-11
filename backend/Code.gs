@@ -1,4 +1,4 @@
-const HEADERS = [
+const FIELD_KEYS = [
   'session_id',
   'chip_id',
   'cat_id',
@@ -10,9 +10,21 @@ const HEADERS = [
   'sample_count',
 ];
 
+const SHEET_HEADERS = [
+  '紀錄編號',
+  '晶片編號',
+  '貓咪',
+  '進入時間',
+  '離開時間',
+  '停留秒數',
+  '最短距離（mm）',
+  '平均距離（mm）',
+  '取樣次數',
+];
+
 const MAX_BODY_BYTES = 4096;
 const ALLOWED_TOP_LEVEL_KEYS = new Set(['device_token', 'session']);
-const ALLOWED_SESSION_KEYS = new Set(HEADERS);
+const ALLOWED_SESSION_KEYS = new Set(FIELD_KEYS);
 
 function jsonResponse_(payload) {
   return ContentService.createTextOutput(JSON.stringify(payload))
@@ -93,12 +105,17 @@ function validate_(session) {
 function ensureSheet_(spreadsheetId) {
   const sheet = SpreadsheetApp.openById(spreadsheetId).getSheets()[0];
   if (sheet.getLastRow() === 0) {
-    sheet.appendRow(HEADERS);
+    sheet.appendRow(SHEET_HEADERS);
     return sheet;
   }
-  const actualHeaders = sheet.getRange(1, 1, 1, HEADERS.length).getValues()[0];
-  if (sheet.getLastColumn() !== HEADERS.length ||
-      actualHeaders.some((value, index) => value !== HEADERS[index])) {
+  const actualHeaders = sheet.getRange(1, 1, 1, SHEET_HEADERS.length).getValues()[0];
+  const isLegacySchema = actualHeaders.every((value, index) => value === FIELD_KEYS[index]);
+  if (isLegacySchema && sheet.getLastColumn() === FIELD_KEYS.length) {
+    sheet.getRange(1, 1, 1, SHEET_HEADERS.length).setValues([SHEET_HEADERS]);
+    return sheet;
+  }
+  if (sheet.getLastColumn() !== SHEET_HEADERS.length ||
+      actualHeaders.some((value, index) => value !== SHEET_HEADERS[index])) {
     throw new Error('invalid_sheet_schema');
   }
   return sheet;
@@ -148,7 +165,7 @@ function doPost(e) {
           return jsonResponse_({ok: true, duplicate: true});
         }
       }
-      sheet.appendRow(HEADERS.map(key => safeCell_(row[key])));
+      sheet.appendRow(FIELD_KEYS.map(key => safeCell_(row[key])));
     } finally {
       lock.releaseLock();
     }

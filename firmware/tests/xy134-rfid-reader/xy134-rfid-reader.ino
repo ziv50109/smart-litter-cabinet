@@ -368,7 +368,7 @@ pre {
 <div class="card">
 
   <div class="label">
-    晶片 ID
+    晶片編號
   </div>
 
   <div
@@ -397,7 +397,7 @@ pre {
 <div class="card">
 
   <div class="label">
-    原始 RFID 資料
+    原始讀取資料
   </div>
 
   <pre id="raw">尚未收到資料</pre>
@@ -453,7 +453,7 @@ async function update() {
     if (data.checksumValid) {
 
       checksum.textContent =
-        "Checksum 正確";
+        "校驗碼正確";
 
       checksum.className =
         "good";
@@ -461,7 +461,7 @@ async function update() {
     } else {
 
       checksum.textContent =
-        "Checksum 錯誤";
+        "校驗碼錯誤";
 
       checksum.className =
         "bad";

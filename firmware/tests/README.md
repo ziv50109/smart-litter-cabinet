@@ -1,6 +1,4 @@
-# Hardware validation tests
-
-## 中文
+# 硬體驗證測試
 
 每個資料夾只驗證一項硬體，並保留「程式版本、接線、實測結果、通過條件」，避免主韌體問題時無法分辨是感測器還是系統邏輯。
 
@@ -9,7 +7,7 @@
 
 ---
 
-## English
+# Hardware validation tests
 
 Each directory validates one hardware component and records the sketch version, wiring, measured results, and acceptance criteria. This makes it easier to separate sensor failures from main-firmware logic issues.
 
