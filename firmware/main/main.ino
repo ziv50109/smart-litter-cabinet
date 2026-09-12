@@ -12,6 +12,10 @@
 #include <stdlib.h>
 #include "app_config.h"
 #include "certificates.h"
+#include "visit_logic.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 
 // Keep secrets.h ONLY on the local computer used to compile/flash the board.
 // Do not add it to Cirkit or any shared/cloud project.
@@ -25,15 +29,7 @@
 #define DEBUG_WEB_SERVER false
 #endif
 
-enum class State {
-  IDLE,
-  CANDIDATE_ENTRY,
-  IDENTIFYING,
-  OCCUPIED,
-  CANDIDATE_EXIT,
-  EXIT_IDENTIFYING,
-  UPLOAD
-};
+
 
 struct SessionRecord {
   String session_id;
@@ -51,9 +47,26 @@ VL53L0X tof;
 HardwareSerial rfidSerial(1);
 Preferences prefs;
 WebServer debugServer(80);
-State state = State::IDLE;
+Visit::Engine visit;
 SessionRecord currentSession;
-uint32_t stateSinceMs = 0;
+uint32_t lastRangeMs = 0;
+bool ranged = false;
+uint32_t maxRangeGapMs = 0;
+uint32_t seenScanGeneration = 0;
+uint32_t failedRecords = 0;
+uint32_t storageErrors = 0;
+bool journalWritable = true;
+String recentReason = "none";
+String recentState = "尚無紀錄";
+String recentSessionId;
+time_t eventStartUtc = 0;
+struct UploadJob { char id[81]; char json[2048]; };
+struct UploadResult { char id[81]; int status; bool ok; };
+QueueHandle_t uploadJobs = nullptr;
+QueueHandle_t uploadResults = nullptr;
+bool uploadBusy = false;
+bool retryScheduled = false;
+uint32_t lastUploadAttempt = 0;
 uint32_t sessionStartMs = 0;
 uint64_t distanceSumMm = 0;
 uint32_t invalidDistanceSinceMs = 0;
@@ -77,6 +90,7 @@ String rfidLastStatus = "尚未掃描";
 String rfidScanLabel = "掃描";
 
 void serviceDebugServer();
+bool checkpointActiveSession();
 
 uint32_t fnv1a32(const String &text) {
   uint32_t hash = 0x811C9DC5;
@@ -161,62 +175,56 @@ bool parseRfidFrame(const String &frame, String &chipId) {
   return true;
 }
 
-void startRfidScan(const char *label) {
-  rfidOn();
-  rfidScanActive = true;
-  rfidReceiving = false;
-  rfidScanStartedMs = millis();
-  rfidBytesSeen = 0;
-  rfidInvalidFrames = 0;
-  rfidFrameBuffer = "";
-  rfidLastRaw = "";
-  rfidScanLabel = label;
-  rfidLastStatus = rfidScanLabel + "：正在等待晶片";
+void syncRfidScan() {
+  if (visit.scanGeneration != seenScanGeneration) {
+    rfidOff();
+    seenScanGeneration = visit.scanGeneration;
+    rfidReceiving = false;
+    rfidFrameBuffer = "";
+    rfidBytesSeen = 0;
+    rfidInvalidFrames = 0;
+    rfidLastRaw = "";
+    rfidScanLabel = visit.exitScan ? "離開掃描" : "進入／補掃";
+    if (visit.scanning) rfidOn();
+  }
+  rfidScanActive = visit.scanning;
+  if (!visit.scanning && rfidEnabled) rfidOff();
+  switch (visit.scanResult) {
+    case Visit::ScanResult::Scanning: rfidLastStatus = "掃描中"; break;
+    case Visit::ScanResult::Valid: rfidLastStatus = visit.conflict ? "有效晶片與事件身分衝突" : "已取得有效晶片"; break;
+    case Visit::ScanResult::Timeout: rfidLastStatus = "10秒內未取得有效封包，保留事件身分"; break;
+    case Visit::ScanResult::Cancelled: rfidLastStatus = "事件期限到，保留事件身分"; break;
+    default: rfidLastStatus = "尚未掃描";
+  }
 }
 
-bool pollRfidScan() {
-  if (!rfidScanActive) return false;
-  while (rfidSerial.available()) {
+void pollRfidScan() {
+  visit.tick(millis());
+  syncRfidScan();
+  // Bound each UART service pass; noise cannot monopolize the sensor loop.
+  for (unsigned budget = 0; budget < 96 && visit.scanning && rfidSerial.available(); ++budget) {
     const char c = static_cast<char>(rfidSerial.read());
-    rfidBytesSeen++;
-    if (rfidLastRaw.length() >= 80) rfidLastRaw.remove(0, 1);
-    if (static_cast<uint8_t>(c) >= 0x20) rfidLastRaw += c;
-    if (c == '$') {
-      rfidFrameBuffer = "";
-      rfidReceiving = true;
-    } else if (c == '#' && rfidReceiving) {
+    ++rfidBytesSeen;
+    if (c == '$') { rfidFrameBuffer = ""; rfidReceiving = true; }
+    else if (c == '#' && rfidReceiving) {
       String chipId;
-      if (parseRfidFrame(rfidFrameBuffer, chipId)) {
-        currentSession.chip_id = chipId;
-        currentSession.cat_id = catNameForChip(chipId);
-        rfidLastStatus = rfidScanLabel + "：已收到有效封包";
-        Serial.printf("RFID cat=%s read=yes\n", currentSession.cat_id.c_str());
-        rfidOff();
+      if (parseRfidFrame(rfidFrameBuffer, chipId) && visit.acceptChip(millis(), chipId.c_str())) {
+        currentSession.chip_id = visit.chip;
+        currentSession.cat_id = catNameForChip(currentSession.chip_id);
+        rfidLastRaw = "有效封包（晶片已遮罩）";
         checkpointActiveSession();
-        return true;
+        Serial.printf("RFID valid=yes identity_retained=yes conflict=%s\n", visit.conflict ? "yes" : "no");
+      } else {
+        ++rfidInvalidFrames;
+        rfidLastRaw = "無效封包（原文不公開）";
       }
-      rfidInvalidFrames++;
-      rfidLastStatus = rfidScanLabel + "：收到資料但格式或校驗錯誤";
       rfidReceiving = false;
     } else if (rfidReceiving) {
       if (rfidFrameBuffer.length() < 24) rfidFrameBuffer += c;
-      else {
-        rfidInvalidFrames++;
-        rfidLastStatus = rfidScanLabel + "：收到過長的無效封包";
-        rfidReceiving = false;
-      }
+      else { ++rfidInvalidFrames; rfidReceiving = false; }
     }
   }
-  if (millis() - rfidScanStartedMs >= Config::RFID_TIMEOUT_MS) {
-    rfidLastStatus = rfidScanLabel + (rfidBytesSeen == 0
-                                       ? "：3秒內未收到 UART 資料"
-                                       : "：3秒內沒有有效封包");
-    Serial.printf("RFID cat=unknown read=no bytes=%lu invalid=%lu\n",
-                  static_cast<unsigned long>(rfidBytesSeen),
-                  static_cast<unsigned long>(rfidInvalidFrames));
-    rfidOff();
-  }
-  return false;
+  syncRfidScan();
 }
 
 bool initToF() {
@@ -245,36 +253,14 @@ uint16_t readDistanceMm() {
   return latestDistanceMm;
 }
 
-void responsiveDelay(uint32_t durationMs) {
-  if (!DEBUG_WEB_SERVER) {
-    delay(durationMs);
-    return;
-  }
-  const uint32_t started = millis();
-  while (millis() - started < durationMs) {
-    serviceDebugServer();
-    if (rfidScanActive) pollRfidScan();
-    delay(2);
-  }
-}
 
-void idleLowPowerWait() {
-  rfidOff();
-  if (DEBUG_WEB_SERVER) {
-    responsiveDelay(Config::IDLE_RANGING_PERIOD_MS);
-    return;
-  }
-  WiFi.mode(WIFI_OFF);
-  const uint64_t sleepUs = static_cast<uint64_t>(Config::IDLE_RANGING_PERIOD_MS) * 1000ULL;
-  esp_sleep_enable_timer_wakeup(sleepUs);
-  esp_light_sleep_start();
-}
 
 void resetSession() {
   currentSession = SessionRecord{};
   distanceSumMm = 0;
   sessionStartMs = 0;
   lastCheckpointMs = 0;
+  eventStartUtc = 0;
 }
 
 void addDistanceSample(uint16_t distance) {
@@ -318,8 +304,7 @@ bool connectWifiAndTryTime() {
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     const uint32_t started = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - started < Config::WIFI_TIMEOUT_MS) {
-      serviceDebugServer();
-      delay(100);
+      vTaskDelay(pdMS_TO_TICKS(100));
     }
   }
   if (WiFi.status() != WL_CONNECTED) return false;
@@ -328,8 +313,7 @@ bool connectWifiAndTryTime() {
     configTzTime("UTC0", "time.google.com", "pool.ntp.org");
     const uint32_t ntpStarted = millis();
     while (!timeIsValid() && millis() - ntpStarted < Config::NTP_TIMEOUT_MS) {
-      serviceDebugServer();
-      delay(100);
+      vTaskDelay(pdMS_TO_TICKS(100));
     }
   }
   return true;
@@ -341,14 +325,7 @@ void disconnectWifi() {
   WiFi.mode(WIFI_OFF);
 }
 
-void ensureTimestampsIfTimeValid(SessionRecord &record) {
-  if (record.enter_time.length() && record.exit_time.length()) return;
-  if (!timeIsValid()) return;
-  const time_t exitEpoch = time(nullptr);
-  const time_t enterEpoch = exitEpoch - static_cast<time_t>(record.duration_sec);
-  record.enter_time = formatIsoUtc(enterEpoch);
-  record.exit_time = formatIsoUtc(exitEpoch);
-}
+
 
 String jsonEscape(const String &input) {
   String output;
@@ -380,9 +357,11 @@ String recordJson(const SessionRecord &record) {
   return json;
 }
 
-bool uploadRecord(SessionRecord &record, bool allowTimestampBackfill) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  if (allowTimestampBackfill) ensureTimestampsIfTimeValid(record);
+UploadResult uploadRecord(const UploadJob &job) {
+  UploadResult result{};
+  strlcpy(result.id, job.id, sizeof(result.id));
+  result.status = -1;
+  if (WiFi.status() != WL_CONNECTED) return result;
   WiFiClientSecure postClient;
   postClient.setCACert(GOOGLE_ROOT_CA_BUNDLE);
   HTTPClient postHttp;
@@ -390,13 +369,11 @@ bool uploadRecord(SessionRecord &record, bool allowTimestampBackfill) {
   postHttp.setTimeout(15000);
   postHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
   if (!postHttp.begin(postClient, APP_SCRIPT_URL)) {
-    lastUploadStatus = -1;
-    lastUploadOk = false;
-    lastUploadResponse = "Apps Script HTTPS 初始化失敗";
-    return false;
+    result.status = -1;
+    return result;
   }
   postHttp.addHeader("Content-Type", "application/json");
-  const int postStatus = postHttp.POST(recordJson(record));
+  const int postStatus = postHttp.POST(String(job.json));
   String response = postStatus > 0 ? postHttp.getString() : postHttp.errorToString(postStatus);
   const String redirectUrl = postHttp.getLocation();
   postHttp.end();
@@ -404,10 +381,8 @@ bool uploadRecord(SessionRecord &record, bool allowTimestampBackfill) {
   int status = postStatus;
   if (postStatus == HTTP_CODE_FOUND || postStatus == HTTP_CODE_SEE_OTHER) {
     if (!redirectUrl.startsWith("https://")) {
-      lastUploadStatus = postStatus;
-      lastUploadOk = false;
-      lastUploadResponse = "Apps Script 回傳不安全或空白的重新導向網址";
-      return false;
+      result.status = postStatus;
+    return result;
     }
 
     // Apps Script ContentService returns its JSON through a one-time
@@ -420,10 +395,8 @@ bool uploadRecord(SessionRecord &record, bool allowTimestampBackfill) {
     resultHttp.setTimeout(15000);
     resultHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     if (!resultHttp.begin(resultClient, redirectUrl)) {
-      lastUploadStatus = -1;
-      lastUploadOk = false;
-      lastUploadResponse = "Apps Script 結果頁 HTTPS 初始化失敗";
-      return false;
+      result.status = -1;
+    return result;
     }
     status = resultHttp.GET();
     response = status > 0 ? resultHttp.getString() : resultHttp.errorToString(status);
@@ -431,11 +404,23 @@ bool uploadRecord(SessionRecord &record, bool allowTimestampBackfill) {
   }
 
   const bool ok = status >= 200 && status < 300 && response.indexOf("\"ok\":true") >= 0;
-  lastUploadStatus = status;
-  lastUploadOk = ok;
-  lastUploadResponse = response.substring(0, 160);
-  Serial.printf("UPLOAD status=%d ok=%s\n", status, ok ? "true" : "false");
-  return ok;
+  result.status = status;
+  result.ok = ok;
+  return result;
+}
+
+// Only this worker owns networking. Queues copy fixed-size snapshots, never String pointers.
+void uploadWorker(void *) {
+  UploadJob job{};
+  while (true) {
+    if (xQueueReceive(uploadJobs, &job, pdMS_TO_TICKS(1000)) != pdTRUE) continue;
+    UploadResult result{};
+    strlcpy(result.id, job.id, sizeof(result.id));
+    result.status = -1;
+    if (connectWifiAndTryTime()) result = uploadRecord(job);
+    disconnectWifi();
+    xQueueSend(uploadResults, &result, portMAX_DELAY);
+  }
 }
 
 String encodeRecord(const SessionRecord &r) {
@@ -547,10 +532,10 @@ bool loadQueueMeta(uint8_t &head, uint8_t &count) {
                      parsedCount <= Config::MAX_PENDING_RECORDS &&
                      storedChecksum == fnv1a32("1:" + fields[1] + ":" + fields[2]);
   if (!valid) {
-    Serial.println("PENDING queue metadata invalid; resetting queue metadata");
+    Serial.println("PENDING queue metadata invalid; preserving all slots");
     head = 0;
     count = 0;
-    return storeQueueMeta(head, count);
+    return false;
   }
   head = static_cast<uint8_t>(parsedHead);
   count = static_cast<uint8_t>(parsedCount);
@@ -562,7 +547,7 @@ bool enqueuePending(const SessionRecord &record) {
   uint8_t count = 0;
   if (!loadQueueMeta(head, count)) return false;
   if (count >= Config::MAX_PENDING_RECORDS) {
-    Serial.println("PENDING queue full; record remains in RAM until restart");
+    Serial.println("PENDING queue full; new record cannot be saved");
     return false;
   }
   const uint8_t tail = (head + count) % Config::MAX_PENDING_RECORDS;
@@ -573,7 +558,7 @@ bool enqueuePending(const SessionRecord &record) {
     return false;
   }
   // qmeta is one NVS value, so count/head become visible atomically. If power
-  // fails before this write, the active-session checkpoint still owns record.
+  // fails before this write, the slot is not queued; report failure, never replay the journal.
   if (!storeQueueMeta(head, count + 1)) return false;
   Serial.printf("PENDING queued=%u\n", count + 1);
   return true;
@@ -590,99 +575,124 @@ bool removeOldestPending() {
   return storeQueueMeta((head + 1) % Config::MAX_PENDING_RECORDS, count - 1);
 }
 
-void flushPending() {
-  while (true) {
-    uint8_t head = 0;
-    uint8_t count = 0;
-    if (!loadQueueMeta(head, count) || !count) break;
-    SessionRecord pending;
-    if (!decodeRecord(prefs.getString(queueKey(head).c_str(), ""), pending)) {
-      Serial.println("PENDING record invalid; discarding corrupt slot");
-      if (!removeOldestPending()) break;
-      continue;
-    }
-    // Pending records may intentionally have blank timestamps. Never turn
-    // their retry time into an apparent event time.
-    if (!uploadRecord(pending, false)) break;
-    if (!removeOldestPending()) break;
-  }
-}
-
-void transitionTo(State next, bool resetInvalidDistance = true) {
-  state = next;
-  stateSinceMs = millis();
-  if (resetInvalidDistance) invalidDistanceSinceMs = 0;
+void storageFailure(const char *message) {
+  ++storageErrors;
+  recentState = message;
+  Serial.printf("STORAGE error: %s\n", message);
 }
 
 bool checkpointActiveSession() {
-  if (!currentSession.session_id.length() || currentSession.sample_count == 0) return true;
+  if (!journalWritable || !visit.active() || !currentSession.session_id.length()) return false;
+  // Journal is diagnostic only after reboot: never replay it as a completed visit.
   SessionRecord snapshot = currentSession;
-  if (snapshot.duration_sec == 0) {
-    snapshot.duration_sec = max(1UL, (millis() - sessionStartMs) / 1000UL);
-  }
-  snapshot.avg_distance_mm = static_cast<float>(distanceSumMm) / snapshot.sample_count;
-  const String encoded = encodeRecord(snapshot);
+  snapshot.duration_sec = max(1UL, visit.elapsed(millis()) / 1000UL);
+  snapshot.avg_distance_mm = snapshot.sample_count
+    ? static_cast<float>(distanceSumMm) / snapshot.sample_count : 0;
+  const String encoded = String("v2|") + (visit.conflict ? "conflict|" : "incomplete|") + encodeRecord(snapshot);
   if (prefs.putString("active", encoded) != encoded.length()) {
-    Serial.println("ACTIVE checkpoint write failed");
-    return false;
+    storageFailure("活動備份失敗"); return false;
   }
   lastCheckpointMs = millis();
   return true;
 }
 
-bool restoreActiveSession() {
-  const String encoded = prefs.getString("active", "");
-  SessionRecord restored;
-  if (!encoded.length() || !decodeRecord(encoded, restored)) {
-    if (encoded.length()) prefs.remove("active");
-    return false;
+void recoverJournal() {
+  if (!prefs.isKey("active")) return;
+  // Preserve one interrupted journal without guessing elapsed powered-off time.
+  if (prefs.isKey("interrupted")) {
+    journalWritable = false;
+    storageFailure("中斷紀錄槽已滿，保留原備份並停用活動備份");
+    return;
   }
-  currentSession = restored;
-  const uint32_t maxRestoredSeconds = Config::MAX_SESSION_DURATION_MS / 1000UL;
-  const uint32_t restoredSeconds = restored.duration_sec > maxRestoredSeconds
-                                       ? maxRestoredSeconds
-                                       : restored.duration_sec;
-  sessionStartMs = millis() - restoredSeconds * 1000UL;
-  distanceSumMm = static_cast<uint64_t>(restored.avg_distance_mm * restored.sample_count);
-  lastCheckpointMs = millis();
-  Serial.println("Recovered an interrupted active session from NVS");
-  return true;
+  const String saved = prefs.getString("active", "");
+  if (!saved.length() || prefs.putString("interrupted", saved) != saved.length()) {
+    journalWritable = false; storageFailure("中斷紀錄保存失敗"); return;
+  }
+  if (!prefs.remove("active")) {
+    journalWritable = false; storageFailure("舊活動備份清除失敗"); return;
+  }
+  recentState = "重啟中斷紀錄已保留本機，不上傳";
 }
 
-const char *stateName(State value) {
+void serviceUploads() {
+  if (!uploadJobs || !uploadResults) return;
+  UploadResult result{};
+  if (xQueueReceive(uploadResults, &result, 0) == pdTRUE) {
+    uploadBusy = false;
+    lastUploadStatus = result.status;
+    lastUploadOk = result.ok;
+    lastUploadResponse = result.ok ? "上傳成功" : "上傳失敗，保留待傳紀錄";
+    bool acknowledged = result.ok;
+    if (result.ok) {
+      uint8_t head = 0, count = 0;
+      SessionRecord queued;
+      if (!loadQueueMeta(head, count) || !count ||
+          !decodeRecord(prefs.getString(queueKey(head).c_str(), ""), queued) ||
+          queued.session_id != result.id || !removeOldestPending()) {
+        storageFailure("上傳成功但佇列確認失敗，保留重試");
+        acknowledged = false;
+      } else if (recentSessionId == result.id) recentState = "上傳成功";
+    }
+    retryScheduled = !acknowledged;
+    lastUploadAttempt = millis();
+  }
+  if (uploadBusy || (retryScheduled && uint32_t(millis() - lastUploadAttempt) < 60000)) return;
+  uint8_t head = 0, count = 0;
+  if (!loadQueueMeta(head, count)) { retryScheduled = true; lastUploadAttempt = millis(); storageFailure("待傳索引損毀"); return; }
+  if (!count) return;
+  SessionRecord queued;
+  if (!decodeRecord(prefs.getString(queueKey(head).c_str(), ""), queued)) {
+    retryScheduled = true; lastUploadAttempt = millis(); storageFailure("待傳紀錄損毀，保留資料"); return;
+  }
+  UploadJob job{};
+  const String json = recordJson(queued);
+  if (json.length() >= sizeof(job.json)) {
+    retryScheduled = true; lastUploadAttempt = millis(); storageFailure("上傳快照超出容量"); return;
+  }
+  strlcpy(job.id, queued.session_id.c_str(), sizeof(job.id));
+  strlcpy(job.json, json.c_str(), sizeof(job.json));
+  if (xQueueSend(uploadJobs, &job, 0) == pdTRUE) uploadBusy = true;
+}
+
+const char *stateName(Visit::Phase value) {
   switch (value) {
-    case State::IDLE: return "待機";
-    case State::CANDIDATE_ENTRY: return "確認進入";
-    case State::IDENTIFYING: return "辨識晶片";
-    case State::OCCUPIED: return "停留中";
-    case State::CANDIDATE_EXIT: return "確認離開";
-    case State::EXIT_IDENTIFYING: return "離開補掃晶片";
-    case State::UPLOAD: return "上傳中";
+    case Visit::Phase::Idle: return "待機";
+    case Visit::Phase::Entry: return "入口活動中";
+    case Visit::Phase::Inside: return "推定在內部";
+    case Visit::Phase::Exit: return "離開候選";
+    case Visit::Phase::Complete: return "結案";
+    case Visit::Phase::WaitClear: return "等待入口恢復";
   }
   return "未知";
+}
+String maskedChip(const String &chip) {
+  if (!chip.length()) return "尚未辨識";
+  if (chip == "unknown") return chip;
+  return "***********" + chip.substring(chip.length() > 4 ? chip.length() - 4 : 0);
 }
 
 String debugStatusJson() {
   uint8_t queueHead = 0;
   uint8_t queueCount = 0;
   const bool queueValid = loadQueueMeta(queueHead, queueCount);
-  const uint32_t durationSec = sessionStartMs == 0 ? 0 : (millis() - sessionStartMs) / 1000UL;
+  const uint32_t durationSec = visit.active() ? visit.elapsed(millis()) / 1000UL : 0;
   const float averageDistance = currentSession.sample_count == 0
                                     ? 0
                                     : static_cast<float>(distanceSumMm) / currentSession.sample_count;
   String json;
   json.reserve(900);
-  json += "{\"state\":\"" + jsonEscape(stateName(state)) + "\",";
+  json += "{\"state\":\"" + jsonEscape(stateName(visit.phase)) + "\",";
   json += "\"distance_mm\":" + String(latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm) + ",";
   json += "\"tof_ok\":" + String(latestDistanceMm != UINT16_MAX ? "true" : "false") + ",";
   json += "\"below_entry_threshold\":" + String(latestDistanceMm != UINT16_MAX && latestDistanceMm < Config::ENTRY_THRESHOLD_MM ? "true" : "false") + ",";
   json += "\"rfid_enabled\":" + String(rfidEnabled ? "true" : "false") + ",";
   json += "\"rfid_scanning\":" + String(rfidScanActive ? "true" : "false") + ",";
-  json += "\"rfid_status\":\"" + jsonEscape(rfidLastStatus) + "\",";
+  json += "\"rfid_status\":\"" + jsonEscape(rfidScanLabel + "：" + rfidLastStatus) + "\",";
   json += "\"rfid_raw\":\"" + jsonEscape(rfidLastRaw) + "\",";
   json += "\"rfid_bytes\":" + String(rfidBytesSeen) + ",";
   json += "\"rfid_invalid_frames\":" + String(rfidInvalidFrames) + ",";
-  json += "\"chip_id\":\"" + jsonEscape(currentSession.chip_id) + "\",";
+  json += "\"chip_id\":\"" + jsonEscape(maskedChip(currentSession.chip_id)) + "\",";
+  json += "\"scan_chip\":\"" + jsonEscape(maskedChip(visit.scanChip)) + "\",";
   json += "\"cat_id\":\"" + jsonEscape(currentSession.cat_id) + "\",";
   json += "\"session_id\":\"" + jsonEscape(currentSession.session_id) + "\",";
   json += "\"duration_sec\":" + String(durationSec) + ",";
@@ -694,7 +704,15 @@ String debugStatusJson() {
   json += "\"pending_count\":" + String(queueValid ? queueCount : 0) + ",";
   json += "\"last_upload_status\":" + String(lastUploadStatus) + ",";
   json += "\"last_upload_ok\":" + String(lastUploadOk ? "true" : "false") + ",";
-  json += "\"last_upload_response\":\"" + jsonEscape(lastUploadResponse) + "\"}";
+  json += "\"last_upload_response\":\"" + jsonEscape(lastUploadResponse) + "\",";
+  json += "\"clear_sec\":" + String(visit.clearElapsed(millis()) / 1000UL) + ",";
+  json += "\"identity_conflict\":" + String(visit.conflict ? "true" : "false") + ",";
+  json += "\"recent_reason\":\"" + jsonEscape(recentReason) + "\",";
+  json += "\"recent_state\":\"" + jsonEscape(recentState) + "\",";
+  json += "\"failed_records\":" + String(failedRecords) + ",";
+  json += "\"storage_errors\":" + String(storageErrors) + ",";
+  json += "\"interrupted_pending\":" + String(prefs.isKey("interrupted") || !journalWritable ? "true" : "false") + ",";
+  json += "\"max_range_gap_ms\":" + String(maxRangeGapMs) + "}";
   return json;
 }
 
@@ -712,18 +730,20 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:.4rem 0 0}small{color:#9c
 <section class="card"><div class="label">VL53L0X 距離</div><div id="distance" class="value">--</div><small id="tof">--</small></section>
 <section class="card"><div class="label">RFID</div><div id="rfid" class="value">--</div><small id="rfidStats">--</small></section>
 <section class="card"><div class="label">晶片編號／貓咪</div><div id="identity" class="value">--</div></section>
-<section class="card"><div class="label">原始 UART</div><pre id="raw">尚未收到資料</pre></section>
+<section class="card"><div class="label">UART 結果（遮罩）</div><pre id="raw">尚未收到資料</pre></section>
 <section class="card"><div class="label">目前紀錄</div><div id="session" class="value">--</div><small id="metrics">--</small></section>
 <section class="card"><div class="label">上傳</div><div id="upload" class="value">--</div><small id="pending">--</small></section>
+<section class="card"><div class="label">事件收尾與儲存</div><div id="closure"></div></section>
 </div><script>
 const show=(id,text)=>document.getElementById(id).textContent=text;
 async function update(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();
-show('state',d.state);show('network',d.wifi_connected?'Wi-Fi 已連線 · '+d.ip:'Wi-Fi 未連線');
+show('state',d.state+' · 清空 '+d.clear_sec+' 秒'+(d.identity_conflict?' · 身分衝突':''));show('network',d.wifi_connected?'Wi-Fi 已連線 · '+d.ip:'Wi-Fi 未連線');
 show('distance',d.tof_ok?d.distance_mm+' mm':'讀取逾時');show('tof',d.below_entry_threshold?'小於 200mm：已達進入門檻':'等待小於 200mm');
 show('rfid',(d.rfid_enabled?'已開啟':'已關閉')+' · '+d.rfid_status);show('rfidStats','UART 位元組 '+d.rfid_bytes+' · 無效封包 '+d.rfid_invalid_frames);
-show('identity',(d.chip_id||'--')+' ／ '+(d.cat_id||'--'));show('raw',d.rfid_raw||'尚未收到資料');
+show('identity',(d.chip_id||'--')+' ／ '+(d.cat_id||'--'));show('raw','本輪：'+d.scan_chip+' · '+(d.rfid_raw||'尚未收到資料'));
 show('session',d.session_id||'尚無紀錄');show('metrics','停留 '+d.duration_sec+'秒 · 最短 '+d.min_distance_mm+'mm · 平均 '+d.avg_distance_mm+'mm · '+d.sample_count+'次');
 show('upload',d.last_upload_ok?'最近上傳成功':(d.last_upload_status?'最近上傳失敗：'+d.last_upload_status:'尚未上傳'));show('pending','待上傳 '+d.pending_count+' 筆'+(d.last_upload_response?' · '+d.last_upload_response:''));
+show('closure',d.recent_reason+' · '+d.recent_state+' · 未保存 '+d.failed_records+' 筆 · 儲存錯誤 '+d.storage_errors+' · 最大量測間隔 '+d.max_range_gap_ms+'ms'+(d.interrupted_pending?' · 有本機中斷紀錄待查':''));
 }catch(e){show('network','無法連線至裝置');}}update();setInterval(update,250);
 </script></body></html>)rawliteral";
 
@@ -733,15 +753,8 @@ void serviceDebugServer() {
 
 void startDebugServer() {
   if (!DEBUG_WEB_SERVER || strlen(WIFI_SSID) == 0 || strlen(WIFI_PASSWORD) == 0) return;
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  const uint32_t started = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - started < Config::WIFI_TIMEOUT_MS) delay(100);
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("DEBUG web server Wi-Fi connection failed");
-    return;
-  }
+  if (WiFi.status() != WL_CONNECTED) return;
+
   debugServer.on("/", HTTP_GET, []() { debugServer.send_P(200, "text/html; charset=utf-8", DEBUG_HTML); });
   debugServer.on("/api/status", HTTP_GET, []() {
     debugServer.sendHeader("Cache-Control", "no-store");
@@ -768,179 +781,68 @@ void handleInvalidDistance() {
   }
 }
 
-bool sessionNeedsFailSafeClose() {
-  const uint32_t now = millis();
-  return (sessionStartMs != 0 && now - sessionStartMs >= Config::MAX_SESSION_DURATION_MS) ||
-         (invalidDistanceSinceMs != 0 &&
-          now - invalidDistanceSinceMs >= Config::MAX_INVALID_OCCUPIED_MS);
-}
-
 void beginSession(uint16_t distance) {
   resetSession();
-  currentSession.chip_id = "unknown";
-  currentSession.cat_id = "unknown";
-  sessionStartMs = millis();
+  currentSession.session_id = createSessionId();
+  sessionStartMs = visit.started;
+  // Only use an already available clock anchor. Missing UTC remains blank.
+  if (timeIsValid()) eventStartUtc = time(nullptr);
   addDistanceSample(distance);
-  startRfidScan("進入掃描");
   checkpointActiveSession();
 }
 
-void finalizeSession() {
-  currentSession.duration_sec = (millis() - sessionStartMs) / 1000UL;
-  if (currentSession.duration_sec == 0) currentSession.duration_sec = 1;
-  if (currentSession.sample_count == 0) {
-    currentSession.min_distance_mm = 2000;
-    currentSession.avg_distance_mm = 2000;
-  } else {
-    currentSession.avg_distance_mm = static_cast<float>(distanceSumMm) / currentSession.sample_count;
+void finishSession() {
+  SessionRecord completed = currentSession;
+  completed.duration_sec = max(1UL, visit.durationMs() / 1000UL);
+  if (!completed.chip_id.length()) {
+    completed.chip_id = "unknown"; completed.cat_id = "unknown";
   }
-}
-
-void finishSessionAndPrepareUpload() {
-  finalizeSession();
-  checkpointActiveSession();
-  if (rfidScanActive) {
-    transitionTo(State::EXIT_IDENTIFYING);
-  } else {
-    transitionTo(State::UPLOAD);
+  completed.avg_distance_mm = completed.sample_count
+    ? static_cast<float>(distanceSumMm) / completed.sample_count : 0;
+  if (eventStartUtc) {
+    completed.enter_time = formatIsoUtc(eventStartUtc);
+    completed.exit_time = formatIsoUtc(eventStartUtc + completed.duration_sec);
   }
+  recentSessionId = completed.session_id;
+  recentReason = visit.conflict ? "identity_conflict" : Visit::reasonName(visit.reason);
+  if (visit.conflict) {
+    recentState = "身分衝突，捨棄且不上傳";
+  } else if (enqueuePending(completed)) {
+    recentState = "已保存，待上傳";
+  } else {
+    ++failedRecords;
+    storageFailure("事件未保存：佇列滿或儲存失敗");
+  }
+  // Reboot never replays this journal, even when remove fails.
+  if (journalWritable && prefs.isKey("active") && !prefs.remove("active")) {
+    journalWritable = false; storageFailure("結案備份清除失敗，停用活動備份");
+  }
+  Serial.printf("EVENT reason=%s saved_state=%s lost=%lu\n", recentReason.c_str(), recentState.c_str(),
+    static_cast<unsigned long>(failedRecords));
+  rfidOff();
+  visit.release();
+  resetSession();
 }
 
 void processStateMachine() {
   const uint32_t now = millis();
-  switch (state) {
-    case State::IDLE: {
-      idleLowPowerWait();
-      const uint16_t d = readDistanceMm();
-      if (d == UINT16_MAX) {
-        handleInvalidDistance();
-      } else {
-        invalidDistanceSinceMs = 0;
-        if (d < Config::ENTRY_THRESHOLD_MM) {
-          beginSession(d);
-          transitionTo(State::CANDIDATE_ENTRY);
-        }
-      }
-      break;
-    }
-    case State::CANDIDATE_ENTRY: {
-      pollRfidScan();
-      const uint16_t d = readDistanceMm();
-      if (d == UINT16_MAX) {
-        handleInvalidDistance();
-        rfidOff();
-        resetSession();
-        transitionTo(State::IDLE, false);
-      } else if (d >= Config::ENTRY_THRESHOLD_MM) {
-        invalidDistanceSinceMs = 0;
-        rfidOff();
-        resetSession();
-        transitionTo(State::IDLE);
-      }
-      else if (now - stateSinceMs >= Config::ENTRY_DEBOUNCE_MS) {
-        currentSession.session_id = createSessionId();
-        checkpointActiveSession();
-        transitionTo(State::OCCUPIED);
-      }
-      responsiveDelay(Config::ACTIVE_RANGING_PERIOD_MS);
-      break;
-    }
-    case State::IDENTIFYING: {
-      const bool identified = pollRfidScan();
-      const uint16_t d = readDistanceMm();
-      if (d == UINT16_MAX) handleInvalidDistance();
-      else {
-        invalidDistanceSinceMs = 0;
-        addDistanceSample(d);
-      }
-      if (identified || !rfidScanActive) {
-        transitionTo(d != UINT16_MAX && d >= Config::EXIT_THRESHOLD_MM
-                         ? State::CANDIDATE_EXIT
-                         : State::OCCUPIED);
-      }
-      responsiveDelay(Config::ACTIVE_RANGING_PERIOD_MS);
-      break;
-    }
-    case State::OCCUPIED: {
-      pollRfidScan();
-      const uint16_t d = readDistanceMm();
-      if (d == UINT16_MAX) handleInvalidDistance();
-      else {
-        invalidDistanceSinceMs = 0;
-        addDistanceSample(d);
-        if (d >= Config::EXIT_THRESHOLD_MM) {
-          rfidOff();
-          startRfidScan("離開掃描");
-          transitionTo(State::CANDIDATE_EXIT);
-        }
-      }
-      if (sessionNeedsFailSafeClose()) {
-        Serial.println("Closing session after sensor/session fail-safe limit");
-        finishSessionAndPrepareUpload();
-        break;
-      }
-      if (millis() - lastCheckpointMs >= Config::SESSION_CHECKPOINT_MS) checkpointActiveSession();
-      responsiveDelay(Config::ACTIVE_RANGING_PERIOD_MS);
-      break;
-    }
-    case State::CANDIDATE_EXIT: {
-      pollRfidScan();
-      const uint16_t d = readDistanceMm();
-      if (d == UINT16_MAX) {
-        handleInvalidDistance();
-        stateSinceMs = now;
-      } else if (d < Config::EXIT_THRESHOLD_MM) {
-        invalidDistanceSinceMs = 0;
-        addDistanceSample(d);
-        rfidOff();
-        transitionTo(State::OCCUPIED);
-      } else if (now - stateSinceMs >= Config::EXIT_DEBOUNCE_MS) {
-        finishSessionAndPrepareUpload();
-      }
-      if (state == State::CANDIDATE_EXIT && sessionNeedsFailSafeClose()) {
-        Serial.println("Closing session after sensor/session fail-safe limit");
-        finishSessionAndPrepareUpload();
-        break;
-      }
-      responsiveDelay(Config::ACTIVE_RANGING_PERIOD_MS);
-      break;
-    }
-    case State::EXIT_IDENTIFYING: {
-      const bool identified = pollRfidScan();
-      if (identified || !rfidScanActive) {
-        checkpointActiveSession();
-        transitionTo(State::UPLOAD);
-      }
-      responsiveDelay(Config::ACTIVE_RANGING_PERIOD_MS);
-      break;
-    }
-    case State::UPLOAD: {
-      const bool online = connectWifiAndTryTime();
-      // Timestamp the current event as soon as this upload cycle obtains a
-      // valid clock. Older queued events intentionally remain untouched.
-      if (online && currentSession.session_id.length()) ensureTimestampsIfTimeValid(currentSession);
-      if (online) flushPending();
-      bool currentSafe = currentSession.session_id.length() == 0;
-      if (!currentSafe) {
-        currentSafe = online && uploadRecord(currentSession, true);
-        if (!currentSafe) currentSafe = enqueuePending(currentSession);
-      }
-      disconnectWifi();
-      if (!currentSafe) {
-        // Queue is full. Keep the record and its NVS checkpoint, then retry later.
-        if (DEBUG_WEB_SERVER) responsiveDelay(60000);
-        else {
-          esp_sleep_enable_timer_wakeup(60000000ULL);
-          esp_light_sleep_start();
-        }
-        break;
-      }
-      if (!prefs.remove("active")) Serial.println("ACTIVE checkpoint remove failed; duplicate retry is safe");
-      resetSession();
-      transitionTo(State::IDLE);
-      break;
-    }
+  if (!ranged || uint32_t(now - lastRangeMs) >= Config::ACTIVE_RANGING_PERIOD_MS) {
+    if (ranged) maxRangeGapMs = max(maxRangeGapMs, uint32_t(now - lastRangeMs));
+    lastRangeMs = now; ranged = true;
+    const uint16_t d = readDistanceMm();
+    const bool wasActive = visit.active();
+    visit.sample(millis(), d != UINT16_MAX, d);
+    if (!wasActive && visit.active()) beginSession(d);
+    else if (visit.active()) addDistanceSample(d);
+    if (d == UINT16_MAX) handleInvalidDistance();
+    else invalidDistanceSinceMs = 0;
   }
+  visit.tick(millis());
+  syncRfidScan();
+  pollRfidScan();
+  if (visit.phase == Visit::Phase::Complete) finishSession();
+  if (visit.active() && uint32_t(millis() - lastCheckpointMs) >= Config::SESSION_CHECKPOINT_MS)
+    checkpointActiveSession();
 }
 
 void setup() {
@@ -950,16 +852,29 @@ void setup() {
   pinMode(Config::TOF_INT_PIN, INPUT_PULLUP);
   WiFi.mode(WIFI_OFF);
   rfidSerial.begin(9600, SERIAL_8N1, Config::RFID_RX_PIN, Config::RFID_TX_PIN);
-  prefs.begin("litter", false);
+  if (!prefs.begin("litter", false)) {
+    journalWritable = false;
+    storageFailure("NVS 開啟失敗，無法確認舊紀錄");
+  }
   if (!initToF()) {
     Serial.println("VL53L0X not found; idle recovery will retry with backoff");
   }
-  uint8_t queueHead = 0;
-  uint8_t queueCount = 0;
-  const bool queueReady = loadQueueMeta(queueHead, queueCount);
-  if (restoreActiveSession()) transitionTo(State::OCCUPIED);
-  else if (queueReady && queueCount > 0) transitionTo(State::UPLOAD);
-  else transitionTo(State::IDLE);
+  if (journalWritable) recoverJournal();
+  visit.phase = prefs.isKey("interrupted") || !journalWritable ? Visit::Phase::WaitClear : Visit::Phase::Idle;
+  uploadJobs = xQueueCreate(1, sizeof(UploadJob));
+  uploadResults = xQueueCreate(1, sizeof(UploadResult));
+  if (!uploadJobs || !uploadResults ||
+      xTaskCreatePinnedToCore(uploadWorker, "upload", 12288, nullptr, 1, nullptr, 0) != pdPASS) {
+    storageFailure("背景上傳工作建立失敗");
+    if (uploadJobs) vQueueDelete(uploadJobs);
+    if (uploadResults) vQueueDelete(uploadResults);
+    uploadJobs = nullptr; uploadResults = nullptr;
+  }
+  if (DEBUG_WEB_SERVER && strlen(WIFI_SSID)) {
+    WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    configTzTime("UTC0", "time.google.com", "pool.ntp.org");
+  }
+
   Serial.println("Smart litter monitor ready");
   startDebugServer();
 }
@@ -967,5 +882,20 @@ void setup() {
 void loop() {
   serviceDebugServer();
   processStateMachine();
+  serviceUploads();
+  if (!debugServerStarted) startDebugServer();
   serviceDebugServer();
+  static uint32_t lastReport = 0;
+  if (uint32_t(millis() - lastReport) >= 1000) {
+    lastReport = millis();
+    Serial.printf("STATE=%s elapsed=%lu clear=%lu scan=%s result=%s retained=%s cat=%s conflict=%u closure=%s storage=%s lost=%lu errors=%lu\n",
+      stateName(visit.phase), static_cast<unsigned long>(visit.active() ? visit.elapsed(millis()) : 0),
+      static_cast<unsigned long>(visit.clearElapsed(millis())), rfidScanLabel.c_str(),
+      rfidLastStatus.c_str(), maskedChip(currentSession.chip_id).c_str(), currentSession.cat_id.c_str(),
+      visit.conflict, recentReason.c_str(), recentState.c_str(),
+      static_cast<unsigned long>(failedRecords), static_cast<unsigned long>(storageErrors));
+    Serial.printf("SCAN scanning=%u chip=%s upload=%d ok=%u\n", visit.scanning,
+      maskedChip(visit.scanChip).c_str(), lastUploadStatus, lastUploadOk);
+  }
+  delay(1);
 }

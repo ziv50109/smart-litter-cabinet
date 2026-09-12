@@ -10,23 +10,20 @@ The current design uses RFID and ToF. Camera-based recognition is an archived ex
 
 ```mermaid
 flowchart TD
-    Battery[503450 LiPo battery] --> Boost[MT3608 boosts to 5V]
-    Boost --> ESP32[XIAO ESP32-S3]
-    Boost --> RFID[XY_134.2K RFID reader]
-    ESP32 --> ToF[VL53L0X distance sensor]
-
-    ToF -->|First reading below 200mm| Detect[Start entry scan and 300ms debounce together]
-    Detect -->|Enable reader| RFID
-    RFID -->|Valid FDX-B frame| Identify[Resolve chip ID and cat]
-    RFID -->|No valid read within 3 seconds| Unknown[Keep identity provisionally unknown]
-    Identify --> Monitor[Track distance and visit duration]
-    Unknown --> Monitor
-    Monitor -->|First reading at least 200mm| Exit[Start exit scan and 500ms debounce together]
-    Exit -->|Distance returns below 200mm| Monitor
-    Exit -->|Confirmed exit and scan complete| WiFi[Keep last valid identity and upload]
-    WiFi --> Script[Google Apps Script]
-    Script --> Sheet[Smart litter cabinet log]
-    Sheet --> Sleep[Disable Wi-Fi and RFID; return to idle]
+    Battery[503450 LiPo] --> Boost[MT3608 boosts to 5V]
+    Boost -->|USB-C| ESP32[XIAO ESP32-S3]
+    ESP32 -->|Board 5V| RFID[XY_134.2K RFID]
+    ESP32 -->|Board 3.3V| ToF[VL53L0X]
+    ToF -->|First reading below 200mm| Entry[Entry activity: start event and RFID]
+    Entry -->|Continuously valid clear for 10s| Inside[Presumed inside: retain identity]
+    Inside -->|Below 200mm again| Exit[Exit candidate: scan RFID again]
+    Exit -->|Clear for 10s and scan complete| Close[Completed snapshot]
+    Entry -->|No exit candidate by 90s| Close
+    Inside -->|No exit candidate by 90s| Close
+    Exit -->|Still unconfirmed at 100s| Close
+    Close -->|Identity conflict| Drop[Discard without upload]
+    Close -->|No conflict| Queue[NVS pending queue]
+    Queue --> Worker[Background HTTPS delivery to Google Sheets]
 ```
 
 ## Structure
@@ -43,9 +40,9 @@ Sensitive configuration is injected locally: `secrets.example.h` defines the int
 
 ## Status
 
-- Main system: the current firmware compiles; wiring, 5V power, ToF, RFID, and offline delivery to Google Sheets have been validated on hardware
+- Main system: the revised event logic still requires hardware validation; compilation and simulation do not establish real cat-visit accuracy.
 - Debug dashboard: optional local-only WebServer shows live ToF, RFID UART validation, state, session, Wi-Fi, and upload queue data
-- RFID identification: starts immediately at each entry/exit threshold crossing, up to three seconds per scan; a missed exit read retains the entry identity. Both misses leave unknown. This timing revision still requires hardware validation.
+- RFID identification: up to 10 seconds per scan; misses preserve identity and conflicts are not uploaded. See [firmware rules](firmware/main/README.md).
 - VL53L0X: standalone web distance test is under `firmware/tests/`
 - RFID: a 130mm coil reads the implanted 2×12mm FDX-B chip at approximately 10–13cm in the installed test environment
 - Vision: archived and not part of the current MVP

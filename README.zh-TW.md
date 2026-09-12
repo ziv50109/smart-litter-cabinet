@@ -11,22 +11,19 @@
 ```mermaid
 flowchart TD
     Battery[503450 鋰電池] --> Boost[MT3608 升壓至 5V]
-    Boost --> ESP32[XIAO ESP32-S3]
-    Boost --> RFID[XY_134.2K RFID 讀卡器]
-    ESP32 --> ToF[VL53L0X 距離感測器]
-
-    ToF -->|首次讀到小於 200mm| Detect[立即啟動進入掃描與 300ms 防抖]
-    Detect -->|開啟讀卡器| RFID
-    RFID -->|收到有效 FDX-B 封包| Identify[取得晶片編號與貓咪名稱]
-    RFID -->|3秒內未讀到有效資料| Unknown[暫時保留未知身分]
-    Identify --> Monitor[記錄距離與停留時間]
-    Unknown --> Monitor
-    Monitor -->|首次讀到大於等於 200mm| Exit[立即啟動離開掃描與 500ms 防抖]
-    Exit -->|距離回到小於 200mm| Monitor
-    Exit -->|確認離開且掃描結束| WiFi[保留最後有效身分並上傳]
-    WiFi --> Script[Google Apps Script]
-    Script --> Sheet[貓砂櫃智慧偵測紀錄]
-    Sheet --> Sleep[關閉 Wi-Fi 與 RFID，回到待機]
+    Boost -->|USB-C| ESP32[XIAO ESP32-S3]
+    ESP32 -->|板上 5V| RFID[XY_134.2K RFID]
+    ESP32 -->|板上 3.3V| ToF[VL53L0X]
+    ToF -->|首次小於 200mm| Entry[入口活動：建立事件並掃 RFID]
+    Entry -->|連續有效清空 10 秒| Inside[推定在內部：保留身分]
+    Inside -->|再次小於 200mm| Exit[離開候選：再次掃 RFID]
+    Exit -->|連續清空 10 秒且掃描完成| Close[結案快照]
+    Entry -->|90 秒沒有離開候選| Close
+    Inside -->|90 秒沒有離開候選| Close
+    Exit -->|100 秒仍未確認| Close
+    Close -->|身分衝突| Drop[捨棄，不上傳]
+    Close -->|無衝突| Queue[NVS 待傳佇列]
+    Queue --> Worker[背景 HTTPS 上傳至 Google Sheets]
 ```
 
 ## 目錄
@@ -43,9 +40,9 @@ flowchart TD
 
 ## 狀態
 
-- 主系統：目前韌體已編譯通過；實機接線、5V 供電、ToF、RFID 與 Google Sheets 離線補送均已驗證
+- 主系統：事件判定修訂的實機驗證仍待進行；編譯與模擬不代表已驗證貓咪真實進出。
 - 除錯頁：可選用的區域網路 WebServer，即時顯示 ToF、RFID UART 校驗、狀態、紀錄、Wi-Fi 與上傳佇列
-- RFID 辨識：進出首次跨過門檻立即掃描，每次最多 3 秒；離開漏讀沿用進入身分，兩次漏讀才為 unknown。此掃描時機修訂仍待實機驗證。
+- RFID 辨識：每輪最多 10 秒，保留事件身分，漏讀不清除，衝突不上傳。完整規則見 [主韌體說明](firmware/main/README.md)。
 - VL53L0X：獨立網頁測距程式已收入 `firmware/tests/`
 - RFID：130mm 線圈在實際環境中可隔著貓咪皮膚讀取 2×12mm FDX-B 晶片，實測距離約 10–13cm
 - Vision：歸檔，現階段不繼續開發
