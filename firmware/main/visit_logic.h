@@ -72,10 +72,13 @@ struct Engine {
       clearVerifiedMs = 0;
     } else {
       const uint32_t interval = uint32_t(now - lastSample);
-      const uint32_t credit = interval < Config::ACTIVE_RANGING_PERIOD_MS
-        ? interval : Config::ACTIVE_RANGING_PERIOD_MS;
-      clearVerifiedMs = UINT32_MAX - clearVerifiedMs < credit
-        ? UINT32_MAX : clearVerifiedMs + credit;
+      if (interval > Config::CLEAR_SAMPLE_GAP_MS) {
+        // This sample starts a new verified-clear run; the unsampled gap is not clear evidence.
+        clearVerifiedMs = 0;
+      } else {
+        clearVerifiedMs = UINT32_MAX - clearVerifiedMs < interval
+          ? UINT32_MAX : clearVerifiedMs + interval;
+      }
     }
     sampled = true; lastSample = now; previousValid = valid; previousBlocked = blocked;
     if (phase == Phase::WaitClear) { if (valid && !blocked) phase = Phase::Idle; return; }

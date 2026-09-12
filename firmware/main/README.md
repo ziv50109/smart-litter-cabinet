@@ -11,7 +11,7 @@ Arduino IDE 安裝 ESP32 平台與 Pololu VL53L0X，選 XIAO ESP32-S3，Verify �
 ## 事件規則
 
 - 待機與活動皆約每 100ms 量測。有效距離 <200mm 只啟動 RFID 候選掃描，不另加遮擋防抖；只有讀到本機設定中已登錄的兩隻貓，才使用首次遮擋時間建立正式事件。有效 >=200mm 為清空。
-- 入口活動中的反覆遮擋合併為同一事件。累積 10 秒已驗證的有效清空樣本才轉為「推定在內部」，不結案。每筆有效樣本最多貢獻一個 100ms 排程週期；未取樣空窗不計時，短暫排程延遲不清除先前進度，無效讀值或再次遮擋才重新累積。
+- 入口活動中的反覆遮擋合併為同一事件。有效距離持續 >=200mm 滿 10 秒才轉為「推定在內部」，不結案。相鄰有效清空樣本相隔不超過 1 秒時，依實際經過時間累積；超過 1 秒視為取樣中斷，當前樣本重新開始計時。距離無效或再次遮擋也歸零。
 - 完全沒有可判定封包時，RFID 候選掃描最多 10 秒。讀到已登錄晶片立即接受；讀到完整但未登錄的晶片立即視為干擾並停止該輪，不繼續等待。入口未取得已登錄身分就不建立事件、不保存、不上傳，並等待入口恢復後才接受新觸發。
 - 推定在內部之後，下一次遮擋建立離開候選並再次掃 RFID。只有離開後連續清空 10 秒、且該輪掃描已完成，才正常結案。離開階段反覆活動不重啟掃描。
 - 從事件起點滿 90 秒仍無離開候選，以 `no_exit_timeout` 結案。90 秒前已有候選，可收尾至第 100 秒；屆時尚未符合正常條件，使用 `exit_unconfirmed_timeout`。
@@ -40,6 +40,8 @@ UART 在掃描窗口內外都持續處理，每次最多接收 96 bytes，並在
 
 LAN log 在解析前以最多 16 bytes 一列保留 HEX 與可讀文字，標示窗口內或窗口外／舊資料；有效窗口外封包顯示 ID 與貓名，但不影響身分判定。掃描結束列出接收量、無效計數及尚未完成的封包長度，超長與被新起始符取代的半包另列原因。原始 UART 僅在本機除錯日誌公開，不送往 Sheets；雜訊或大量資料仍可能使 128 筆 RAM 日誌覆寫，應及時下載。
 
+即時狀態顯示毫秒精度的清空進度、完成狀態或歸零原因。已有累積進度因距離無效、再次遮擋或取樣中斷超過 1 秒而歸零時，事件 log 會另列「清空計時重算」。
+
 單一入口感測器不能證明移動方向或已如廁。探頭後退出、或在清空確認期間完整往返，可能合併或以 timeout 結案。結案原因只在本機呈現，Google Sheets 的既有欄位無法區分正常與 timeout。約 100ms 的排程不是硬即時保證；真實量測間隔、天線位置、兩隻貓的動作、長時間觀察後補讀及耗電仍須實機驗證。
 
 ---
@@ -57,7 +59,7 @@ Install the ESP32 platform and Pololu VL53L0X in Arduino IDE; select XIAO ESP32-
 ## Event rules
 
 - Idle and active measurements are scheduled about every 100ms. A valid <200mm reading starts only an RFID candidate scan without extra blockage debounce. A formal event, anchored to that first blockage, is created only after one of the two locally registered cats is read. Valid >=200mm is clear.
-- Repeated entrance activity belongs to one event. Ten seconds of verified valid-clear samples changes the phase to presumed inside without closing it. Each sample contributes at most one 100ms schedule period: unsampled gaps add no time, short scheduling delays preserve prior progress, and invalid or blocked readings reset confirmation.
+- Repeated entrance activity belongs to one event. A valid distance >=200mm sustained for ten seconds changes the phase to presumed inside without closing it. Consecutive valid-clear samples no more than one second apart accumulate actual elapsed time. A gap over one second starts a new run at the current sample; invalid or blocked readings also reset it.
 - An entry candidate waits up to ten seconds only when no decisive frame arrives. A registered chip is accepted immediately; a complete unregistered chip is rejected as interference immediately and ends that scan. Without a registered entry identity, no event is created, stored or uploaded; another attempt requires entrance recovery first.
 - The next blockage after presumed inside starts an exit candidate and another RFID scan. Normal closure requires ten seconds of continuous clear after exit and a completed scan. Exit movement does not restart scanning.
 - No exit candidate by 90 seconds from entry closes with `no_exit_timeout`. A candidate before 90 seconds may finish through second 100; if normal conditions are still unmet, close with `exit_unconfirmed_timeout`.
@@ -85,5 +87,7 @@ ESP32 RAM retains the latest 128 rows across page refreshes, but not device rest
 UART is serviced inside and outside scan windows, up to 96 bytes per pass, including before distance/web service. Startup matches the standalone reader: set ON/OFF HIGH, wait 200ms, then initialize UART1 at 9600 8N1 with RX=GPIO44 and TX=-1. The reader stays enabled after scan completion, timeout and event closure. GPIO43 wiring may remain, but the RFID UART does not assign a transmit pin. Continuous operation consumes more power than on-demand activation; scan windows control identity acceptance, not reader power. Starting a scan does not drain UART: existing backlog and cross-window frames are diagnostic only and cannot create events or carry identity into the next scan. Frames processed at or after the deadline are also excluded because hardware arrival timestamps are unavailable.
 
 Before parsing, the LAN log records HEX and printable text in rows of up to 16 bytes, labeled in-window or outside/stale. Valid outside-window frames show their ID and cat without affecting event identity. Scan summaries retain byte and invalid-frame counts plus the unfinished frame length; oversized frames and partial frames replaced by a new start marker have explicit diagnostics. Raw UART stays in local debug logs, never Sheets. Noise or heavy traffic can still overwrite the 128-row RAM ring; download promptly.
+
+Live status shows millisecond-precision clear progress, completion, or the current reset reason. If accumulated progress is reset by an invalid reading, another blockage, or a sample gap over one second, the event log adds a `clear timer restarted` diagnostic row.
 
 A single entrance sensor cannot establish direction or prove toileting. Peeking and retreating, or a complete round trip within clear confirmation, can merge into one event or end by timeout. Closure reasons are local only; existing Sheets fields cannot distinguish normal closure from timeout. The approximately 100ms schedule is not a hard real-time guarantee. Actual sample gaps, antenna placement, both cats' movements, delayed RFID rescans and power consumption require hardware validation.

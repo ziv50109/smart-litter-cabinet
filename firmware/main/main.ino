@@ -804,6 +804,15 @@ String maskedChip(const String &chip) {
   return "***********" + chip.substring(chip.length() > 4 ? chip.length() - 4 : 0);
 }
 
+String clearStatus() {
+  if (latestDistanceMm == UINT16_MAX) return "距離無效，清空計時歸零";
+  if (latestDistanceMm < Config::ENTRY_THRESHOLD_MM) return "入口遮擋，清空計時歸零";
+  const uint32_t clearMs = visit.clearElapsed(millis());
+  if (clearMs >= Config::CLEAR_INTERVAL_MS) return "清空確認完成，可判定下一次遮擋";
+  return "清空累積 " + String(clearMs / 1000.0f, 1) + " / " +
+    String(Config::CLEAR_INTERVAL_MS / 1000UL) + " 秒";
+}
+
 String debugStatusJson() {
   uint8_t queueHead = 0;
   uint8_t queueCount = 0;
@@ -839,6 +848,8 @@ String debugStatusJson() {
   json += "\"last_upload_ok\":" + String(lastUploadOk ? "true" : "false") + ",";
   json += "\"last_upload_response\":\"" + jsonEscape(lastUploadResponse) + "\",";
   json += "\"clear_sec\":" + String(visit.clearElapsed(millis()) / 1000UL) + ",";
+  json += "\"clear_ms\":" + String(visit.clearElapsed(millis())) + ",";
+  json += "\"clear_status\":\"" + jsonEscape(clearStatus()) + "\",";
   json += "\"identity_conflict\":" + String(visit.conflict ? "true" : "false") + ",";
   json += "\"recent_reason\":\"" + jsonEscape(recentReason) + "\",";
   json += "\"recent_state\":\"" + jsonEscape(recentState) + "\",";
@@ -907,7 +918,7 @@ async function update(){
  try{
   const s=await fetch('/api/status',{cache:'no-store'});if(!s.ok)throw Error('狀態讀取失敗');
   const status=await s.json();
-  el('live').textContent=(status.tof_ok?status.distance_mm+'mm':'距離無效')+' · '+status.state+' · 清空累積 '+status.clear_sec+'秒 · '+status.rfid_status+' · UART '+status.rfid_bytes+' bytes／無效封包 '+status.rfid_invalid_frames;
+  el('live').textContent=(status.tof_ok?status.distance_mm+'mm':'距離無效')+' · '+status.state+' · '+status.clear_status+' · '+status.rfid_status+' · UART '+status.rfid_bytes+' bytes／無效封包 '+status.rfid_invalid_frames;
   el('upload').textContent='待傳 '+status.pending_count+' 筆 · '+status.recent_state;
   const response=await fetch('/api/logs?after='+cursor,{cache:'no-store'});if(!response.ok)throw Error('紀錄讀取失敗');
   let page=await response.json();
@@ -1031,7 +1042,19 @@ void processStateMachine() {
     lastRangeMs = now; ranged = true;
     const uint16_t d = readDistanceMm();
     const Visit::Phase previousPhase = visit.phase;
-    visit.sample(millis(), d != UINT16_MAX, d);
+    const bool previousClear = visit.clear;
+    const uint32_t previousClearMs = visit.clearElapsed(now);
+    const uint32_t previousSampleMs = visit.lastSample;
+    visit.sample(now, d != UINT16_MAX, d);
+    if (previousClear && previousClearMs > 0 && visit.clearElapsed(now) == 0) {
+      const uint32_t gapMs = uint32_t(now - previousSampleMs);
+      const char *reason = d == UINT16_MAX ? "距離無效" :
+        (d < Config::ENTRY_THRESHOLD_MM ? "入口再次遮擋" :
+         (gapMs > Config::CLEAR_SAMPLE_GAP_MS ? "取樣中斷超過1秒" : "清空條件中斷"));
+      logEvent("清空計時重算", currentSession.session_id.c_str(), visit.scanGeneration,
+        currentSession.chip_id.c_str(), currentSession.cat_id.c_str(),
+        d == UINT16_MAX ? -1 : d, reason);
+    }
     if (previousPhase != visit.phase) logEvent("動作判定", currentSession.session_id.c_str(), visit.scanGeneration,
       currentSession.chip_id.c_str(), currentSession.cat_id.c_str(), d == UINT16_MAX ? -1 : d, stateName(visit.phase));
     if (previousPhase == Visit::Phase::Idle && visit.candidate()) {
