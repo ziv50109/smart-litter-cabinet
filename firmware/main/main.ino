@@ -109,6 +109,9 @@ int lastUploadStatus = 0;
 bool lastUploadOk = false;
 String lastUploadResponse;
 String rfidFrameBuffer;
+uint32_t rfidFrameScan = 0;
+bool rfidFrameEligible = false;
+unsigned rfidStaleBytes = 0;
 String rfidLastRaw;
 String rfidLastStatus = "尚未掃描";
 String rfidScanLabel = "掃描";
@@ -145,7 +148,6 @@ void rfidOff() {
 }
 
 void rfidOn() {
-  while (rfidSerial.available()) rfidSerial.read();
   digitalWrite(Config::RFID_ENABLE_PIN, HIGH);
   rfidEnabled = true;
 }
@@ -209,11 +211,11 @@ void syncRfidScan() {
   if (visit.scanGeneration != seenScanGeneration) {
     rfidOff();
     seenScanGeneration = visit.scanGeneration;
-    rfidReceiving = false;
-    rfidFrameBuffer = "";
+    // Bytes already buffered belong to the previous window, never this scan.
+    rfidStaleBytes = rfidSerial.available();
+    rfidFrameEligible = false;
     rfidBytesSeen = 0;
     rfidInvalidFrames = 0;
-    rfidLastRaw = "";
     rfidScanLabel = visit.exitScan ? "離開掃描" : "入口候選掃描";
     logEvent(visit.exitScan ? "離開候選掃描開始" : "入口候選掃描開始",
       currentSession.session_id.c_str(), visit.scanGeneration, "", currentSession.cat_id.c_str(),
@@ -235,6 +237,12 @@ void syncRfidScan() {
     default: rfidLastStatus = "尚未掃描";
   }
   if (scanLogOpen && !visit.scanning) {
+    char summary[128];
+    snprintf(summary, sizeof(summary), "UART %lu bytes / invalid %lu / partial %u",
+      static_cast<unsigned long>(rfidBytesSeen), static_cast<unsigned long>(rfidInvalidFrames),
+      rfidReceiving ? static_cast<unsigned>(rfidFrameBuffer.length()) : 0);
+    logEvent("掃描接收統計", currentSession.session_id.c_str(), visit.scanGeneration,
+      "", "", -1, summary);
     const String scannedCat = visit.scanChip[0] ? catNameForChip(visit.scanChip) : currentSession.cat_id;
     logEvent("掃描結束", currentSession.session_id.c_str(), visit.scanGeneration,
       visit.scanChip, scannedCat.c_str(), latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm,
@@ -243,17 +251,49 @@ void syncRfidScan() {
   }
 }
 
-void pollRfidScan() {
-  visit.tick(millis());
+void pollRfidScan(bool advanceClock = true) {
+  if (advanceClock) visit.tick(millis());
   syncRfidScan();
   // Bound each UART service pass; noise cannot monopolize the sensor loop.
-  for (unsigned budget = 0; budget < 96 && visit.scanning && rfidSerial.available(); ++budget) {
+  char rawHex[49] = {}, rawText[17] = {};
+  unsigned rawCount = 0;
+  bool rawEligible = false;
+  auto flushRaw = [&]() {
+    if (!rawCount) return;
+    char detail[128];
+    snprintf(detail, sizeof(detail), "%s | HEX %s | ASCII %s",
+      rawEligible ? "窗口內" : "窗口外/舊資料", rawHex, rawText);
+    logEvent("UART 原始接收", rawEligible ? currentSession.session_id.c_str() : "", rawEligible ? visit.scanGeneration : 0,
+      "", "", -1, detail);
+    rawCount = 0; rawHex[0] = 0; rawText[0] = 0;
+  };
+  for (unsigned budget = 0; budget < 96 && rfidSerial.available(); ++budget) {
     const char c = static_cast<char>(rfidSerial.read());
-    ++rfidBytesSeen;
-    if (c == '$') { rfidFrameBuffer = ""; rfidReceiving = true; }
+    const bool stale = rfidStaleBytes > 0;
+    if (stale) --rfidStaleBytes;
+    const bool eligible = !stale && visit.scanning &&
+      uint32_t(millis() - visit.scanStarted) < Config::RFID_TIMEOUT_MS;
+    if (rawCount && rawEligible != eligible) flushRaw();
+    rawEligible = eligible;
+    if (eligible) ++rfidBytesSeen;
+    snprintf(rawHex + rawCount * 3, 4, "%02X ", static_cast<unsigned char>(c));
+    rawText[rawCount++] = c >= 32 && c <= 126 ? c : '.';
+    rawText[rawCount] = 0;
+    if (rawCount == 16 || c == '#') flushRaw();
+    if (c == '$') {
+      if (rfidReceiving) logEvent("不完整封包", "", rfidFrameScan, "", "", -1, "新的起始符取代尚未結束的封包");
+      rfidFrameBuffer = ""; rfidReceiving = true;
+      rfidFrameScan = visit.scanGeneration; rfidFrameEligible = eligible;
+    }
     else if (c == '#' && rfidReceiving) {
       String chipId;
-      if (parseRfidFrame(rfidFrameBuffer, chipId) && isRegisteredChip(chipId)) {
+      const bool validFrame = parseRfidFrame(rfidFrameBuffer, chipId);
+      const bool inWindow = eligible && rfidFrameEligible && rfidFrameScan == visit.scanGeneration;
+      if (validFrame && !inWindow) {
+        logEvent("窗口外 RFID", "", rfidFrameScan, chipId.c_str(),
+          catNameForChip(chipId).c_str(), -1, "僅供診斷，不建立或更改事件，不留給下一輪");
+        rfidLastRaw = "窗口外有效封包（晶片已遮罩）";
+      } else if (validFrame && isRegisteredChip(chipId)) {
         const bool wasCandidate = visit.candidate();
         if (!visit.acceptChip(millis(), chipId.c_str())) {
           ++rfidInvalidFrames;
@@ -273,7 +313,7 @@ void pollRfidScan() {
         rfidLastRaw = "有效封包（晶片已遮罩）";
         checkpointActiveSession();
         Serial.printf("RFID valid=yes identity_retained=yes conflict=%s\n", visit.conflict ? "yes" : "no");
-      } else if (chipId.length() == 15 && visit.rejectChip(millis(), chipId.c_str())) {
+      } else if (validFrame && visit.rejectChip(millis(), chipId.c_str())) {
         logEvent("未登錄晶片立即拒絕", currentSession.session_id.c_str(), visit.scanGeneration,
           chipId.c_str(), "未登錄", latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm,
           visit.active() ? "離開干擾，保留事件貓咪" : "入口候選取消，不建立事件");
@@ -289,10 +329,16 @@ void pollRfidScan() {
       }
       rfidReceiving = false;
     } else if (rfidReceiving) {
+      if (!eligible) rfidFrameEligible = false;
       if (rfidFrameBuffer.length() < 24) rfidFrameBuffer += c;
-      else { ++rfidInvalidFrames; rfidReceiving = false; }
+      else {
+        ++rfidInvalidFrames; rfidReceiving = false;
+        flushRaw();
+        logEvent("封包過長", "", rfidFrameScan, "", "", -1, "超過24字元，等待下一個起始符");
+      }
     }
   }
+  flushRaw();
   syncRfidScan();
 }
 
@@ -1056,6 +1102,8 @@ void setup() {
 }
 
 void loop() {
+  // Receive before potentially blocking distance/network service as well as after it.
+  pollRfidScan(false);
   serviceDebugServer();
   processStateMachine();
   serviceUploads();
