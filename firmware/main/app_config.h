@@ -13,7 +13,6 @@ constexpr uint8_t RFID_RX_PIN = 44;     // D7 / GPIO44 <- XY TXD
 constexpr uint16_t ENTRY_THRESHOLD_MM = 200;
 constexpr uint16_t EXIT_THRESHOLD_MM = 200;
 constexpr uint32_t CLEAR_INTERVAL_MS = 10000;
-constexpr uint32_t MAX_SAMPLE_GAP_MS = 250;
 constexpr uint32_t IDLE_RANGING_PERIOD_MS = 100;
 constexpr uint32_t ACTIVE_RANGING_PERIOD_MS = 100;
 constexpr uint32_t TOF_TIMING_BUDGET_US = 20000;

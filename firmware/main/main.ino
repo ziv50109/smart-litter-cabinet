@@ -60,6 +60,8 @@ String recentReason = "none";
 String recentState = "尚無紀錄";
 String recentSessionId;
 time_t eventStartUtc = 0;
+time_t candidateStartUtc = 0;
+uint16_t candidateFirstDistance = UINT16_MAX;
 struct UploadJob { char id[81]; char json[2048]; };
 struct UploadResult { char id[81]; int status; bool ok; };
 QueueHandle_t uploadJobs = nullptr;
@@ -91,6 +93,7 @@ String rfidScanLabel = "掃描";
 
 void serviceDebugServer();
 bool checkpointActiveSession();
+void beginSession(uint16_t distance);
 
 uint32_t fnv1a32(const String &text) {
   uint32_t hash = 0x811C9DC5;
@@ -105,7 +108,12 @@ String catNameForChip(const String &chipId) {
   if (CAT_1_CHIP_RAW[0] != '\0' && chipId == CAT_1_CHIP_RAW) return CAT_1_NAME;
   if (CAT_2_CHIP_RAW[0] != '\0' && chipId == CAT_2_CHIP_RAW) return CAT_2_NAME;
 
-  return "unknown";
+  return "";
+}
+
+bool isRegisteredChip(const String &chipId) {
+  return (CAT_1_CHIP_RAW[0] != '\0' && chipId == CAT_1_CHIP_RAW) ||
+         (CAT_2_CHIP_RAW[0] != '\0' && chipId == CAT_2_CHIP_RAW);
 }
 
 void rfidOff() {
@@ -184,7 +192,7 @@ void syncRfidScan() {
     rfidBytesSeen = 0;
     rfidInvalidFrames = 0;
     rfidLastRaw = "";
-    rfidScanLabel = visit.exitScan ? "離開掃描" : "進入／補掃";
+    rfidScanLabel = visit.exitScan ? "離開掃描" : "入口候選掃描";
     if (visit.scanning) rfidOn();
   }
   rfidScanActive = visit.scanning;
@@ -192,7 +200,11 @@ void syncRfidScan() {
   switch (visit.scanResult) {
     case Visit::ScanResult::Scanning: rfidLastStatus = "掃描中"; break;
     case Visit::ScanResult::Valid: rfidLastStatus = visit.conflict ? "有效晶片與事件身分衝突" : "已取得有效晶片"; break;
-    case Visit::ScanResult::Timeout: rfidLastStatus = "10秒內未取得有效封包，保留事件身分"; break;
+    case Visit::ScanResult::Rejected: rfidLastStatus = "未登錄晶片，已立即拒絕"; break;
+    case Visit::ScanResult::Timeout:
+      rfidLastStatus = visit.chip[0] ? "10秒內未取得有效封包，保留事件身分"
+                                     : "10秒內未取得已登錄晶片，未建立事件";
+      break;
     case Visit::ScanResult::Cancelled: rfidLastStatus = "事件期限到，保留事件身分"; break;
     default: rfidLastStatus = "尚未掃描";
   }
@@ -208,12 +220,25 @@ void pollRfidScan() {
     if (c == '$') { rfidFrameBuffer = ""; rfidReceiving = true; }
     else if (c == '#' && rfidReceiving) {
       String chipId;
-      if (parseRfidFrame(rfidFrameBuffer, chipId) && visit.acceptChip(millis(), chipId.c_str())) {
+      if (parseRfidFrame(rfidFrameBuffer, chipId) && isRegisteredChip(chipId)) {
+        const bool wasCandidate = visit.candidate();
+        if (!visit.acceptChip(millis(), chipId.c_str())) {
+          ++rfidInvalidFrames;
+          rfidLastRaw = "有效封包但掃描已結束";
+          rfidReceiving = false;
+          continue;
+        }
+        if (wasCandidate) beginSession(candidateFirstDistance);
         currentSession.chip_id = visit.chip;
         currentSession.cat_id = catNameForChip(currentSession.chip_id);
         rfidLastRaw = "有效封包（晶片已遮罩）";
         checkpointActiveSession();
         Serial.printf("RFID valid=yes identity_retained=yes conflict=%s\n", visit.conflict ? "yes" : "no");
+      } else if (chipId.length() == 15 && visit.rejectChip(millis(), chipId.c_str())) {
+        candidateStartUtc = 0;
+        candidateFirstDistance = UINT16_MAX;
+        rfidLastRaw = "未登錄晶片（已拒絕，不公開原文）";
+        Serial.println("RFID registered=no action=rejected");
       } else {
         ++rfidInvalidFrames;
         rfidLastRaw = "無效封包（原文不公開）";
@@ -657,6 +682,7 @@ void serviceUploads() {
 const char *stateName(Visit::Phase value) {
   switch (value) {
     case Visit::Phase::Idle: return "待機";
+    case Visit::Phase::Candidate: return "等待已登錄晶片";
     case Visit::Phase::Entry: return "入口活動中";
     case Visit::Phase::Inside: return "推定在內部";
     case Visit::Phase::Exit: return "離開候選";
@@ -785,18 +811,15 @@ void beginSession(uint16_t distance) {
   resetSession();
   currentSession.session_id = createSessionId();
   sessionStartMs = visit.started;
-  // Only use an already available clock anchor. Missing UTC remains blank.
-  if (timeIsValid()) eventStartUtc = time(nullptr);
+  eventStartUtc = candidateStartUtc;
+  candidateStartUtc = 0;
+  candidateFirstDistance = UINT16_MAX;
   addDistanceSample(distance);
-  checkpointActiveSession();
 }
 
 void finishSession() {
   SessionRecord completed = currentSession;
   completed.duration_sec = max(1UL, visit.durationMs() / 1000UL);
-  if (!completed.chip_id.length()) {
-    completed.chip_id = "unknown"; completed.cat_id = "unknown";
-  }
   completed.avg_distance_mm = completed.sample_count
     ? static_cast<float>(distanceSumMm) / completed.sample_count : 0;
   if (eventStartUtc) {
@@ -807,6 +830,9 @@ void finishSession() {
   recentReason = visit.conflict ? "identity_conflict" : Visit::reasonName(visit.reason);
   if (visit.conflict) {
     recentState = "身分衝突，捨棄且不上傳";
+  } else if (!isRegisteredChip(completed.chip_id)) {
+    recentReason = "missing_registered_identity";
+    recentState = "缺少已登錄身分，捨棄且不上傳";
   } else if (enqueuePending(completed)) {
     recentState = "已保存，待上傳";
   } else {
@@ -830,14 +856,24 @@ void processStateMachine() {
     if (ranged) maxRangeGapMs = max(maxRangeGapMs, uint32_t(now - lastRangeMs));
     lastRangeMs = now; ranged = true;
     const uint16_t d = readDistanceMm();
-    const bool wasActive = visit.active();
+    const Visit::Phase previousPhase = visit.phase;
     visit.sample(millis(), d != UINT16_MAX, d);
-    if (!wasActive && visit.active()) beginSession(d);
-    else if (visit.active()) addDistanceSample(d);
+    if (previousPhase == Visit::Phase::Idle && visit.candidate()) {
+      candidateStartUtc = timeIsValid() ? time(nullptr) : 0;
+      candidateFirstDistance = d;
+    } else if (previousPhase == Visit::Phase::Candidate && !visit.candidate()) {
+      candidateStartUtc = 0;
+      candidateFirstDistance = UINT16_MAX;
+    } else if (visit.active()) addDistanceSample(d);
     if (d == UINT16_MAX) handleInvalidDistance();
     else invalidDistanceSinceMs = 0;
   }
+  const bool wasCandidate = visit.candidate();
   visit.tick(millis());
+  if (wasCandidate && !visit.candidate()) {
+    candidateStartUtc = 0;
+    candidateFirstDistance = UINT16_MAX;
+  }
   syncRfidScan();
   pollRfidScan();
   if (visit.phase == Visit::Phase::Complete) finishSession();

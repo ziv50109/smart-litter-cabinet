@@ -10,12 +10,12 @@ Arduino IDE 安裝 ESP32 平台與 Pololu VL53L0X，選 XIAO ESP32-S3，Verify �
 
 ## 事件規則
 
-- 待機與活動皆約每 100ms 量測。有效距離 <200mm 立即建立事件並掃 RFID，不另加遮擋防抖；有效 >=200mm 為清空。
-- 入口活動中的反覆遮擋合併為同一事件。連續有效清空 10 秒才轉為「推定在內部」，不結案。無效讀值、再次遮擋或量測間隔超過 250ms 會中斷清空計時。
-- RFID 每輪最多 10 秒。入口尚未辨識且上一輪已結束時，新的遮擋／清空轉換可立即補掃；進行中的掃描不重啟、不延長。
+- 待機與活動皆約每 100ms 量測。有效距離 <200mm 只啟動 RFID 候選掃描，不另加遮擋防抖；只有讀到本機設定中已登錄的兩隻貓，才使用首次遮擋時間建立正式事件。有效 >=200mm 為清空。
+- 入口活動中的反覆遮擋合併為同一事件。累積 10 秒已驗證的有效清空樣本才轉為「推定在內部」，不結案。每筆有效樣本最多貢獻一個 100ms 排程週期；未取樣空窗不計時，短暫排程延遲不清除先前進度，無效讀值或再次遮擋才重新累積。
+- 完全沒有可判定封包時，RFID 候選掃描最多 10 秒。讀到已登錄晶片立即接受；讀到完整但未登錄的晶片立即視為干擾並停止該輪，不繼續等待。入口未取得已登錄身分就不建立事件、不保存、不上傳，並等待入口恢復後才接受新觸發。
 - 推定在內部之後，下一次遮擋建立離開候選並再次掃 RFID。只有離開後連續清空 10 秒、且該輪掃描已完成，才正常結案。離開階段反覆活動不重啟掃描。
 - 從事件起點滿 90 秒仍無離開候選，以 `no_exit_timeout` 結案。90 秒前已有候選，可收尾至第 100 秒；屆時尚未符合正常條件，使用 `exit_unconfirmed_timeout`。
-- 已知 A 遇到漏讀仍保留 A；入口漏讀可由離開補上。有效 B 與 A 不同則鎖定衝突、保留 A 供診斷，但整筆捨棄不上傳。有效未登錄晶片保留編號，名稱為 unknown；完全沒讀到才在結案輸出 unknown。
+- 正式事件已知 A 時，離開漏讀仍保留 A；離開讀到已登錄的 B 則鎖定衝突、保留 A 供診斷，但整筆捨棄不上傳。離開讀到未登錄晶片會立即停止該輪並視為干擾／漏讀，不更改 A、不製造衝突。系統不建立 unknown 如廁紀錄。
 - 正常結案後立即接受新遮擋，不另設冷卻。強制結案時入口仍遮擋、無效或資訊過期，必須先看到有效清空，再接受新遮擋。
 
 事件起點不因掃描、清空或階段改變而重設。有離開候選時，停留時間與推定離開時間採首次候選時間；無候選則採起點加 90 秒。不計入收尾及網路等待。起點沒有可靠 UTC 時，日期欄留空，不以上傳時間回填。
@@ -48,12 +48,12 @@ Install the ESP32 platform and Pololu VL53L0X in Arduino IDE; select XIAO ESP32-
 
 ## Event rules
 
-- Idle and active measurements are scheduled about every 100ms. A valid <200mm reading immediately starts an event and RFID scan without extra blockage debounce; valid >=200mm is clear.
-- Repeated entrance activity belongs to one event. Ten seconds of continuously valid clear readings changes the phase to presumed inside, without closing it. Invalid readings, blockage or a measurement gap exceeding 250ms reset clear confirmation.
-- Each RFID scan lasts at most ten seconds. While entry identity is missing and no scan is active, a newly observed clear/block transition starts a rescan immediately. Active scans are never restarted or extended.
+- Idle and active measurements are scheduled about every 100ms. A valid <200mm reading starts only an RFID candidate scan without extra blockage debounce. A formal event, anchored to that first blockage, is created only after one of the two locally registered cats is read. Valid >=200mm is clear.
+- Repeated entrance activity belongs to one event. Ten seconds of verified valid-clear samples changes the phase to presumed inside without closing it. Each sample contributes at most one 100ms schedule period: unsampled gaps add no time, short scheduling delays preserve prior progress, and invalid or blocked readings reset confirmation.
+- An entry candidate waits up to ten seconds only when no decisive frame arrives. A registered chip is accepted immediately; a complete unregistered chip is rejected as interference immediately and ends that scan. Without a registered entry identity, no event is created, stored or uploaded; another attempt requires entrance recovery first.
 - The next blockage after presumed inside starts an exit candidate and another RFID scan. Normal closure requires ten seconds of continuous clear after exit and a completed scan. Exit movement does not restart scanning.
 - No exit candidate by 90 seconds from entry closes with `no_exit_timeout`. A candidate before 90 seconds may finish through second 100; if normal conditions are still unmet, close with `exit_unconfirmed_timeout`.
-- A missed read preserves known A; an exit success can fill an entry miss. A different valid B creates a sticky conflict: retain A for diagnosis but discard the entire event. Unregistered valid chips retain their ID with an unknown name. Only events with no valid chip become unknown at closure.
+- Once a formal A event exists, a missed exit read preserves A. Reading the other registered cat B creates a sticky conflict: retain A for diagnosis but discard the event. An unregistered exit chip immediately ends that scan as interference/a miss without changing A or creating a conflict. The system does not create unknown visit records.
 - Normal closure allows the next blockage immediately, without a cooldown. Forced closure with a blocked, invalid or stale entrance observation requires valid clear before another blockage can trigger.
 
 The event start never resets during scans or phase changes. Duration and inferred exit time use the first exit candidate, or entry plus 90 seconds if none exists; finishing and network delays are excluded. Without reliable UTC at entry, date fields remain blank and are never filled with upload time.

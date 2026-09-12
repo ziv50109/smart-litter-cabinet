@@ -14,7 +14,9 @@ flowchart TD
     Boost -->|USB-C| ESP32[XIAO ESP32-S3]
     ESP32 -->|Board 5V| RFID[XY_134.2K RFID]
     ESP32 -->|Board 3.3V| ToF[VL53L0X]
-    ToF -->|First reading below 200mm| Entry[Entry activity: start event and RFID]
+    ToF -->|First reading below 200mm| Candidate[Candidate scan: no event yet]
+    Candidate -->|Registered chip| Entry[Entry activity: anchor event to first blockage]
+    Candidate -->|Unregistered chip or scan timeout| DropCandidate[Discard and wait for entrance recovery]
     Entry -->|Continuously valid clear for 10s| Inside[Presumed inside: retain identity]
     Inside -->|Below 200mm again| Exit[Exit candidate: scan RFID again]
     Exit -->|Clear for 10s and scan complete| Close[Completed snapshot]
@@ -42,7 +44,7 @@ Sensitive configuration is injected locally: `secrets.example.h` defines the int
 
 - Main system: the revised event logic still requires hardware validation; compilation and simulation do not establish real cat-visit accuracy.
 - Debug dashboard: optional local-only WebServer shows live ToF, RFID UART validation, state, session, Wi-Fi, and upload queue data
-- RFID identification: up to 10 seconds per scan; misses preserve identity and conflicts are not uploaded. See [firmware rules](firmware/main/README.md).
+- RFID identification: only the two locally registered cats can create events. Unregistered chips are rejected immediately, entry misses create no record, and exit misses preserve an established identity. See [firmware rules](firmware/main/README.md).
 - VL53L0X: standalone web distance test is under `firmware/tests/`
 - RFID: a 130mm coil reads the implanted 2×12mm FDX-B chip at approximately 10–13cm in the installed test environment
 - Vision: archived and not part of the current MVP

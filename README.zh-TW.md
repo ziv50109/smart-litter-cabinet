@@ -14,7 +14,9 @@ flowchart TD
     Boost -->|USB-C| ESP32[XIAO ESP32-S3]
     ESP32 -->|板上 5V| RFID[XY_134.2K RFID]
     ESP32 -->|板上 3.3V| ToF[VL53L0X]
-    ToF -->|首次小於 200mm| Entry[入口活動：建立事件並掃 RFID]
+    ToF -->|首次小於 200mm| Candidate[候選掃描：尚未建立事件]
+    Candidate -->|已登錄晶片| Entry[入口活動：以首次遮擋建立事件]
+    Candidate -->|未登錄晶片或掃描逾時| DropCandidate[放棄並等待入口恢復]
     Entry -->|連續有效清空 10 秒| Inside[推定在內部：保留身分]
     Inside -->|再次小於 200mm| Exit[離開候選：再次掃 RFID]
     Exit -->|連續清空 10 秒且掃描完成| Close[結案快照]
@@ -42,7 +44,7 @@ flowchart TD
 
 - 主系統：事件判定修訂的實機驗證仍待進行；編譯與模擬不代表已驗證貓咪真實進出。
 - 除錯頁：可選用的區域網路 WebServer，即時顯示 ToF、RFID UART 校驗、狀態、紀錄、Wi-Fi 與上傳佇列
-- RFID 辨識：每輪最多 10 秒，保留事件身分，漏讀不清除，衝突不上傳。完整規則見 [主韌體說明](firmware/main/README.md)。
+- RFID 辨識：只有本機已登錄的兩隻貓能建立事件；未登錄晶片立即拒絕，入口漏讀不建立紀錄，正式事件的離開漏讀保留原身分。完整規則見 [主韌體說明](firmware/main/README.md)。
 - VL53L0X：獨立網頁測距程式已收入 `firmware/tests/`
 - RFID：130mm 線圈在實際環境中可隔著貓咪皮膚讀取 2×12mm FDX-B 晶片，實測距離約 10–13cm
 - Vision：歸檔，現階段不繼續開發
