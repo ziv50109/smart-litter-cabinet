@@ -30,7 +30,11 @@ POST 與 ContentService 重新導向分別建立 HTTPS 連線，使用 Google R1
 
 ## 除錯與限制
 
-本機設定 `DEBUG_WEB_SERVER true` 可啟用 LAN 頁面。Web 與 Serial 分開顯示階段、事件／清空時間、本輪 RFID 結果、保留身分、衝突、最近結案原因及保存／上傳狀態。晶片編號遮罩；不要將除錯頁暴露到網際網路。除錯模式維持 Wi-Fi 連線。
+本機設定 `DEBUG_WEB_SERVER true` 可啟用 LAN 事件 log 頁面。上方保留即時距離、UART 計數及狀態；逐列記錄入口／離開候選掃描開始、完整晶片 ID、貓咪、拒絕／校驗失敗、掃描結束、進出判定及事件結案。上傳使用事件編號與嘗試次數關聯連線、校時、API 開始、POST、重新導向、API 結束及重試，並顯示 HTTP 狀態和耗時。API 開始包含 HTTPS 連線準備，只有後端成功回應才顯示成功。
+
+ESP32 RAM 保留最近 128 筆，重新整理可讀回，重啟清空；覆寫數可見。本頁最多保留 2000 筆，提供暫停自動捲動及下載目前紀錄 JSON；超出或漏接會提示。時間已校準時顯示台灣時間，否則只顯示開機後毫秒數。LAN log 的晶片 ID 完整顯示，Serial 及既有狀態 API 維持遮罩；Wi-Fi 密碼、API token 與原始 HTTP 回應不進 log。不要將頁面公開到網際網路。除錯模式維持 Wi-Fi 連線。
+
+`debug_log.h` 提供固定容量、跨執行緒保護的 RAM 紀錄；`/api/logs?after=序號` 每頁最多回傳 16 筆。後端 Sheets 格式與進出計時不受 log 功能影響。
 
 單一入口感測器不能證明移動方向或已如廁。探頭後退出、或在清空確認期間完整往返，可能合併或以 timeout 結案。結案原因只在本機呈現，Google Sheets 的既有欄位無法區分正常與 timeout。約 100ms 的排程不是硬即時保證；真實量測間隔、天線位置、兩隻貓的動作、長時間觀察後補讀及耗電仍須實機驗證。
 
@@ -68,6 +72,10 @@ POST and ContentService redirects use separate HTTPS connections and public Goog
 
 ## Debugging and limits
 
-Enable `DEBUG_WEB_SERVER true` locally for the LAN page. Web and Serial distinguish phase, event/clear elapsed time, per-scan result, retained identity, conflict, latest closure reason and storage/upload status. Chip IDs are masked. Keep the page off the public internet; debug mode keeps Wi-Fi connected.
+Enable `DEBUG_WEB_SERVER true` locally for the LAN event log. Live distance, UART counters and state remain above chronological rows for entry/exit candidate scan starts, full chip IDs, cat names, rejection/checksum failures, scan ends, state decisions and closure. Upload rows correlate connection, clock sync, API start, POST, redirects, API end and retries by event ID and attempt number, including HTTP status and duration. API start includes HTTPS connection preparation; success requires a successful backend response.
+
+ESP32 RAM retains the latest 128 rows across page refreshes, but not device restarts; overwrite counts are visible. The browser retains up to 2000 rows, supports pausing automatic scrolling and downloading its current rows as JSON, and reports missed or discarded rows. Synchronized timestamps display Taiwan time; otherwise only uptime milliseconds are shown. Full chip IDs appear in the LAN log; Serial and the existing status API remain masked. Wi-Fi passwords, API tokens and raw HTTP responses are never logged. Keep the page off the public internet; debug mode keeps Wi-Fi connected.
+
+`debug_log.h` provides the fixed-capacity, thread-protected RAM log; `/api/logs?after=sequence` returns up to 16 rows per page. Logging leaves the Sheets schema and visit timing unchanged.
 
 A single entrance sensor cannot establish direction or prove toileting. Peeking and retreating, or a complete round trip within clear confirmation, can merge into one event or end by timeout. Closure reasons are local only; existing Sheets fields cannot distinguish normal closure from timeout. The approximately 100ms schedule is not a hard real-time guarantee. Actual sample gaps, antenna placement, both cats' movements, delayed RFID rescans and power consumption require hardware validation.

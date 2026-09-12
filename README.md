@@ -43,7 +43,7 @@ Sensitive configuration is injected locally: `secrets.example.h` defines the int
 ## Status
 
 - Main system: the revised event logic still requires hardware validation; compilation and simulation do not establish real cat-visit accuracy.
-- Debug dashboard: optional local-only WebServer shows live ToF, RFID UART validation, state, session, Wi-Fi, and upload queue data
+- Debug dashboard: the optional LAN page retains timestamped scan and upload logs with full chip IDs and cat names, alongside live distance and UART status. See [firmware debugging](firmware/main/README.md).
 - RFID identification: only the two locally registered cats can create events. Unregistered chips are rejected immediately, entry misses create no record, and exit misses preserve an established identity. See [firmware rules](firmware/main/README.md).
 - VL53L0X: standalone web distance test is under `firmware/tests/`
 - RFID: a 130mm coil reads the implanted 2×12mm FDX-B chip at approximately 10–13cm in the installed test environment

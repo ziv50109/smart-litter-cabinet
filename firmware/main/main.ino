@@ -13,6 +13,7 @@
 #include "app_config.h"
 #include "certificates.h"
 #include "visit_logic.h"
+#include "debug_log.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -62,13 +63,34 @@ String recentSessionId;
 time_t eventStartUtc = 0;
 time_t candidateStartUtc = 0;
 uint16_t candidateFirstDistance = UINT16_MAX;
-struct UploadJob { char id[81]; char json[2048]; };
+struct UploadJob { char id[81]; char json[2048]; char cat[64]; uint32_t attempt; };
 struct UploadResult { char id[81]; int status; bool ok; };
 QueueHandle_t uploadJobs = nullptr;
 QueueHandle_t uploadResults = nullptr;
 bool uploadBusy = false;
 bool retryScheduled = false;
 uint32_t lastUploadAttempt = 0;
+DebugLog::Ring eventLog;
+String logBootId;
+String attemptEventId;
+uint32_t attemptNumber = 0;
+bool scanLogOpen = false;
+const char *stateName(Visit::Phase value);
+
+void logEvent(const char *action, const char *event, uint32_t scan, const char *chip,
+              const char *cat, int distance, const char *detail,
+              uint32_t attempt = 0, int http = 0, uint32_t duration = 0) {
+  if (!DEBUG_WEB_SERVER) return;
+  DebugLog::Row row;
+  row.uptime = millis();
+  const time_t epoch = time(nullptr);
+  row.epoch = epoch > 1700000000 ? epoch : 0;
+  row.action = action; row.scan = scan; row.distance = distance;
+  row.attempt = attempt; row.http = http; row.duration = duration;
+  strlcpy(row.event, event, sizeof(row.event)); strlcpy(row.chip, chip, sizeof(row.chip));
+  strlcpy(row.cat, cat, sizeof(row.cat)); strlcpy(row.detail, detail, sizeof(row.detail));
+  eventLog.append(row);
+}
 uint32_t sessionStartMs = 0;
 uint64_t distanceSumMm = 0;
 uint32_t invalidDistanceSinceMs = 0;
@@ -193,6 +215,10 @@ void syncRfidScan() {
     rfidInvalidFrames = 0;
     rfidLastRaw = "";
     rfidScanLabel = visit.exitScan ? "離開掃描" : "入口候選掃描";
+    logEvent(visit.exitScan ? "離開候選掃描開始" : "入口候選掃描開始",
+      currentSession.session_id.c_str(), visit.scanGeneration, "", currentSession.cat_id.c_str(),
+      latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm, "距離觸發");
+    scanLogOpen = true;
     if (visit.scanning) rfidOn();
   }
   rfidScanActive = visit.scanning;
@@ -207,6 +233,13 @@ void syncRfidScan() {
       break;
     case Visit::ScanResult::Cancelled: rfidLastStatus = "事件期限到，保留事件身分"; break;
     default: rfidLastStatus = "尚未掃描";
+  }
+  if (scanLogOpen && !visit.scanning) {
+    const String scannedCat = visit.scanChip[0] ? catNameForChip(visit.scanChip) : currentSession.cat_id;
+    logEvent("掃描結束", currentSession.session_id.c_str(), visit.scanGeneration,
+      visit.scanChip, scannedCat.c_str(), latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm,
+      rfidLastStatus.c_str(), 0, 0, uint32_t(millis() - visit.scanStarted));
+    scanLogOpen = false;
   }
 }
 
@@ -231,16 +264,27 @@ void pollRfidScan() {
         if (wasCandidate) beginSession(candidateFirstDistance);
         currentSession.chip_id = visit.chip;
         currentSession.cat_id = catNameForChip(currentSession.chip_id);
+        logEvent("收到 RFID", currentSession.session_id.c_str(), visit.scanGeneration,
+          chipId.c_str(), catNameForChip(chipId).c_str(), latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm,
+          visit.conflict ? "兩隻已登錄貓身分衝突" : "已登錄晶片");
+        if (wasCandidate) logEvent("建立進入事件", currentSession.session_id.c_str(), visit.scanGeneration,
+          currentSession.chip_id.c_str(), currentSession.cat_id.c_str(), latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm,
+          "事件起點採首次入口遮擋");
         rfidLastRaw = "有效封包（晶片已遮罩）";
         checkpointActiveSession();
         Serial.printf("RFID valid=yes identity_retained=yes conflict=%s\n", visit.conflict ? "yes" : "no");
       } else if (chipId.length() == 15 && visit.rejectChip(millis(), chipId.c_str())) {
+        logEvent("未登錄晶片立即拒絕", currentSession.session_id.c_str(), visit.scanGeneration,
+          chipId.c_str(), "未登錄", latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm,
+          visit.active() ? "離開干擾，保留事件貓咪" : "入口候選取消，不建立事件");
         candidateStartUtc = 0;
         candidateFirstDistance = UINT16_MAX;
         rfidLastRaw = "未登錄晶片（已拒絕，不公開原文）";
         Serial.println("RFID registered=no action=rejected");
       } else {
         ++rfidInvalidFrames;
+        logEvent("封包校驗失敗", currentSession.session_id.c_str(), visit.scanGeneration,
+          "", "", -1, "封包格式或 XOR 不符，無可信晶片 ID");
         rfidLastRaw = "無效封包（原文不公開）";
       }
       rfidReceiving = false;
@@ -317,13 +361,14 @@ bool timeIsValid() {
   return time(nullptr) > 1700000000;
 }
 
-bool connectWifiAndTryTime() {
+bool connectWifiAndTryTime(const UploadJob &job) {
   if (strlen(WIFI_SSID) == 0 || strlen(WIFI_PASSWORD) == 0 ||
       strlen(DEVICE_TOKEN) == 0 || strlen(APP_SCRIPT_URL) == 0) {
     Serial.println("UPLOAD skipped: local secrets.h is not configured");
     return false;
   }
   if (WiFi.status() != WL_CONNECTED) {
+    logEvent("Wi-Fi 連線開始", job.id, 0, "", job.cat, -1, "上傳前準備", job.attempt);
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -333,13 +378,17 @@ bool connectWifiAndTryTime() {
     }
   }
   if (WiFi.status() != WL_CONNECTED) return false;
+  logEvent("Wi-Fi 已連線", job.id, 0, "", job.cat, -1, "", job.attempt);
 
   if (!timeIsValid()) {
+    logEvent("校時開始", job.id, 0, "", job.cat, -1, "NTP", job.attempt);
     configTzTime("UTC0", "time.google.com", "pool.ntp.org");
     const uint32_t ntpStarted = millis();
     while (!timeIsValid() && millis() - ntpStarted < Config::NTP_TIMEOUT_MS) {
       vTaskDelay(pdMS_TO_TICKS(100));
     }
+    logEvent("校時結束", job.id, 0, "", job.cat, -1,
+      timeIsValid() ? "校時成功" : "校時逾時", job.attempt, 0, uint32_t(millis() - ntpStarted));
   }
   return true;
 }
@@ -384,9 +433,17 @@ String recordJson(const SessionRecord &record) {
 
 UploadResult uploadRecord(const UploadJob &job) {
   UploadResult result{};
+  const uint32_t requestStart = millis();
+  logEvent("API 發送開始", job.id, 0, "", job.cat, -1, "HTTPS 請求流程開始", job.attempt);
+  auto finishRequest = [&]() {
+    logEvent("API 發送結束", job.id, 0, "", job.cat, -1,
+      result.ok ? "後端確認成功" : "失敗，保留待傳紀錄", job.attempt, result.status,
+      uint32_t(millis() - requestStart));
+    return result;
+  };
   strlcpy(result.id, job.id, sizeof(result.id));
   result.status = -1;
-  if (WiFi.status() != WL_CONNECTED) return result;
+  if (WiFi.status() != WL_CONNECTED) return finishRequest();
   WiFiClientSecure postClient;
   postClient.setCACert(GOOGLE_ROOT_CA_BUNDLE);
   HTTPClient postHttp;
@@ -395,10 +452,12 @@ UploadResult uploadRecord(const UploadJob &job) {
   postHttp.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
   if (!postHttp.begin(postClient, APP_SCRIPT_URL)) {
     result.status = -1;
-    return result;
+    return finishRequest();
   }
   postHttp.addHeader("Content-Type", "application/json");
+  logEvent("POST 開始", job.id, 0, "", job.cat, -1, "", job.attempt);
   const int postStatus = postHttp.POST(String(job.json));
+  logEvent("POST 回應", job.id, 0, "", job.cat, -1, "", job.attempt, postStatus);
   String response = postStatus > 0 ? postHttp.getString() : postHttp.errorToString(postStatus);
   const String redirectUrl = postHttp.getLocation();
   postHttp.end();
@@ -407,13 +466,14 @@ UploadResult uploadRecord(const UploadJob &job) {
   if (postStatus == HTTP_CODE_FOUND || postStatus == HTTP_CODE_SEE_OTHER) {
     if (!redirectUrl.startsWith("https://")) {
       result.status = postStatus;
-    return result;
+    return finishRequest();
     }
 
     // Apps Script ContentService returns its JSON through a one-time
     // script.googleusercontent.com URL. Use a fresh TLS connection and GET;
     // reusing the POST client across hosts produces an invalid request.
     WiFiClientSecure resultClient;
+    logEvent("重新導向開始", job.id, 0, "", job.cat, -1, "GET 取得後端結果", job.attempt, postStatus);
     resultClient.setCACert(GOOGLE_ROOT_CA_BUNDLE);
     HTTPClient resultHttp;
     resultHttp.setConnectTimeout(10000);
@@ -421,9 +481,10 @@ UploadResult uploadRecord(const UploadJob &job) {
     resultHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     if (!resultHttp.begin(resultClient, redirectUrl)) {
       result.status = -1;
-    return result;
+    return finishRequest();
     }
     status = resultHttp.GET();
+    logEvent("重新導向回應", job.id, 0, "", job.cat, -1, "", job.attempt, status);
     response = status > 0 ? resultHttp.getString() : resultHttp.errorToString(status);
     resultHttp.end();
   }
@@ -431,7 +492,7 @@ UploadResult uploadRecord(const UploadJob &job) {
   const bool ok = status >= 200 && status < 300 && response.indexOf("\"ok\":true") >= 0;
   result.status = status;
   result.ok = ok;
-  return result;
+  return finishRequest();
 }
 
 // Only this worker owns networking. Queues copy fixed-size snapshots, never String pointers.
@@ -442,7 +503,9 @@ void uploadWorker(void *) {
     UploadResult result{};
     strlcpy(result.id, job.id, sizeof(result.id));
     result.status = -1;
-    if (connectWifiAndTryTime()) result = uploadRecord(job);
+    logEvent("上傳準備開始", job.id, 0, "", job.cat, -1, "檢查連線與時間", job.attempt);
+    if (connectWifiAndTryTime(job)) result = uploadRecord(job);
+    else logEvent("上傳準備失敗", job.id, 0, "", job.cat, -1, "設定缺少或連線失敗，API 未發送", job.attempt);
     disconnectWifi();
     xQueueSend(uploadResults, &result, portMAX_DELAY);
   }
@@ -604,6 +667,7 @@ void storageFailure(const char *message) {
   ++storageErrors;
   recentState = message;
   Serial.printf("STORAGE error: %s\n", message);
+  logEvent("儲存錯誤", "", 0, "", "", -1, message);
 }
 
 bool checkpointActiveSession() {
@@ -660,6 +724,8 @@ void serviceUploads() {
     }
     retryScheduled = !acknowledged;
     lastUploadAttempt = millis();
+    logEvent(acknowledged ? "待傳紀錄已確認" : "等待重試", result.id, 0, "", "", -1,
+      acknowledged ? "佇列確認完成" : "60 秒後重試", attemptNumber, result.status);
   }
   if (uploadBusy || (retryScheduled && uint32_t(millis() - lastUploadAttempt) < 60000)) return;
   uint8_t head = 0, count = 0;
@@ -676,7 +742,11 @@ void serviceUploads() {
   }
   strlcpy(job.id, queued.session_id.c_str(), sizeof(job.id));
   strlcpy(job.json, json.c_str(), sizeof(job.json));
-  if (xQueueSend(uploadJobs, &job, 0) == pdTRUE) uploadBusy = true;
+  strlcpy(job.cat, queued.cat_id.c_str(), sizeof(job.cat));
+  job.attempt = attemptEventId == queued.session_id ? attemptNumber + 1 : 1;
+  if (xQueueSend(uploadJobs, &job, 0) == pdTRUE) {
+    uploadBusy = true; attemptNumber = job.attempt; attemptEventId = queued.session_id;
+  }
 }
 
 const char *stateName(Visit::Phase value) {
@@ -742,35 +812,92 @@ String debugStatusJson() {
   return json;
 }
 
+String debugLogJson(uint32_t after) {
+  // Only the main-thread HTTP handler uses this page; keep it off the small task stack.
+  static DebugLog::Page page;
+  eventLog.read(after, page);
+  String json;
+  json.reserve(9000);
+  json = "{\"boot\":\"" + logBootId + "\",\"oldest\":" + String(page.oldest) +
+    ",\"latest\":" + String(page.latest) + ",\"overwritten\":" + String(page.overwritten) + ",\"rows\":[";
+  for (unsigned i = 0; i < page.count; ++i) {
+    const auto &row = page.rows[i];
+    if (i) json += ",";
+    json += "{\"seq\":" + String(row.seq) + ",\"uptime\":" + String(row.uptime) +
+      ",\"epoch\":" + String(static_cast<uint32_t>(row.epoch)) + ",\"scan\":" + String(row.scan) +
+      ",\"event\":\"" + jsonEscape(row.event) + "\",\"action\":\"" + jsonEscape(row.action) +
+      "\",\"chip\":\"" + jsonEscape(row.chip) + "\",\"cat\":\"" + jsonEscape(row.cat) +
+      "\",\"detail\":\"" + jsonEscape(row.detail) + "\",\"distance\":" + String(row.distance) +
+      ",\"attempt\":" + String(row.attempt) + ",\"http\":" + String(row.http) +
+      ",\"duration\":" + String(row.duration) + "}";
+  }
+  return json + "]}";
+}
+
 static const char DEBUG_HTML[] PROGMEM = R"rawliteral(
 <!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>貓砂櫃即時除錯</title><style>
+<title>貓砂櫃事件紀錄</title><style>
 body{font-family:system-ui,sans-serif;background:#111827;color:#f9fafb;margin:0;padding:16px}
-h1{font-size:1.35rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
-.card{background:#1f2937;border-radius:12px;padding:14px}.label{color:#9ca3af;font-size:.85rem}
-.value{font-size:1.25rem;font-weight:700;overflow-wrap:anywhere}.ok{color:#34d399}.warn{color:#fbbf24}
-pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:.4rem 0 0}small{color:#9ca3af}
-</style></head><body><h1>貓砂櫃即時除錯</h1><div class="grid">
-<section class="card"><div class="label">系統狀態</div><div id="state" class="value">--</div><small id="network">--</small></section>
-<section class="card"><div class="label">VL53L0X 距離</div><div id="distance" class="value">--</div><small id="tof">--</small></section>
-<section class="card"><div class="label">RFID</div><div id="rfid" class="value">--</div><small id="rfidStats">--</small></section>
-<section class="card"><div class="label">晶片編號／貓咪</div><div id="identity" class="value">--</div></section>
-<section class="card"><div class="label">UART 結果（遮罩）</div><pre id="raw">尚未收到資料</pre></section>
-<section class="card"><div class="label">目前紀錄</div><div id="session" class="value">--</div><small id="metrics">--</small></section>
-<section class="card"><div class="label">上傳</div><div id="upload" class="value">--</div><small id="pending">--</small></section>
-<section class="card"><div class="label">事件收尾與儲存</div><div id="closure"></div></section>
-</div><script>
-const show=(id,text)=>document.getElementById(id).textContent=text;
-async function update(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();
-show('state',d.state+' · 清空 '+d.clear_sec+' 秒'+(d.identity_conflict?' · 身分衝突':''));show('network',d.wifi_connected?'Wi-Fi 已連線 · '+d.ip:'Wi-Fi 未連線');
-show('distance',d.tof_ok?d.distance_mm+' mm':'讀取逾時');show('tof',d.below_entry_threshold?'小於 200mm：已達進入門檻':'等待小於 200mm');
-show('rfid',(d.rfid_enabled?'已開啟':'已關閉')+' · '+d.rfid_status);show('rfidStats','UART 位元組 '+d.rfid_bytes+' · 無效封包 '+d.rfid_invalid_frames);
-show('identity',(d.chip_id||'--')+' ／ '+(d.cat_id||'--'));show('raw','本輪：'+d.scan_chip+' · '+(d.rfid_raw||'尚未收到資料'));
-show('session',d.session_id||'尚無紀錄');show('metrics','停留 '+d.duration_sec+'秒 · 最短 '+d.min_distance_mm+'mm · 平均 '+d.avg_distance_mm+'mm · '+d.sample_count+'次');
-show('upload',d.last_upload_ok?'最近上傳成功':(d.last_upload_status?'最近上傳失敗：'+d.last_upload_status:'尚未上傳'));show('pending','待上傳 '+d.pending_count+' 筆'+(d.last_upload_response?' · '+d.last_upload_response:''));
-show('closure',d.recent_reason+' · '+d.recent_state+' · 未保存 '+d.failed_records+' 筆 · 儲存錯誤 '+d.storage_errors+' · 最大量測間隔 '+d.max_range_gap_ms+'ms'+(d.interrupted_pending?' · 有本機中斷紀錄待查':''));
-}catch(e){show('network','無法連線至裝置');}}update();setInterval(update,250);
+h1{font-size:1.4rem;margin:0 0 12px}.bar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:12px 0}
+.card{background:#1f2937;padding:12px;border-radius:8px}button{padding:8px 14px;cursor:pointer}
+#view{overflow:auto;max-height:70vh;border:1px solid #374151}table{border-collapse:collapse;width:100%;font-size:.9rem}
+th,td{padding:10px;text-align:left;border-bottom:1px solid #374151;vertical-align:top}
+th{position:sticky;top:0;background:#1f2937}td{white-space:pre-wrap;overflow-wrap:anywhere}
+td:nth-child(1){min-width:150px}td:nth-child(4){font-family:monospace;white-space:nowrap}
+small,#notice{color:#fbbf24}.error{color:#fca5a5}
+</style></head><body><h1>貓砂櫃事件紀錄</h1>
+<div class="bar"><div id="live" class="card">連線中…</div><div id="upload" class="card"></div></div>
+<div class="bar"><button id="pause">暫停自動捲動</button><button id="download">下載目前紀錄</button>
+<span id="connection">尚未連線</span></div>
+<p id="notice">裝置保留最近 128 筆，重啟清空。完整晶片 ID 僅供本機除錯。</p>
+<div id="view"><table><thead><tr><th>時間戳（台灣）</th><th>掃描／事件</th><th>動作</th><th>掃到的 ID</th><th>貓咪</th><th>判定／結果</th></tr></thead><tbody id="rows"></tbody></table></div>
+<script>
+const el=id=>document.getElementById(id);
+let cursor=0,boot='',records=[],paused=false,missed=0,clientDropped=0;
+const stamp=r=>r.epoch?new Date(r.epoch*1000).toLocaleString('zh-TW',{timeZone:'Asia/Taipei',hour12:false}):'未校時';
+function renderRow(r){
+ const tr=document.createElement('tr');
+ const info=[r.detail,r.distance>=0?'距離 '+r.distance+'mm':'',r.attempt?'第 '+r.attempt+' 次上傳':'',
+ r.http?'HTTP '+r.http:'',r.duration?'耗時 '+r.duration+'ms':''].filter(Boolean).join(' · ');
+ for(const value of [stamp(r)+'\n開機後 '+r.uptime+'ms',(r.scan?'掃描 #'+r.scan+'\n':'')+(r.event||'—'),
+ r.action,r.chip||'—',r.cat||'—',info]){const td=document.createElement('td');td.textContent=value;tr.appendChild(td);}
+ if(/失敗|拒絕|衝突/.test(r.action+' '+r.detail))tr.className='error';
+ el('rows').appendChild(tr);
+}
+async function update(){
+ let more=false;
+ try{
+  const s=await fetch('/api/status',{cache:'no-store'});if(!s.ok)throw Error('狀態讀取失敗');
+  const status=await s.json();
+  el('live').textContent=(status.tof_ok?status.distance_mm+'mm':'距離無效')+' · '+status.state+' · 清空累積 '+status.clear_sec+'秒 · '+status.rfid_status+' · UART '+status.rfid_bytes+' bytes／無效封包 '+status.rfid_invalid_frames;
+  el('upload').textContent='待傳 '+status.pending_count+' 筆 · '+status.recent_state;
+  const response=await fetch('/api/logs?after='+cursor,{cache:'no-store'});if(!response.ok)throw Error('紀錄讀取失敗');
+  let page=await response.json();
+  if(boot&&boot!==page.boot){
+   cursor=0;records=[];missed=0;clientDropped=0;el('rows').replaceChildren();
+   const restart=await fetch('/api/logs?after=0',{cache:'no-store'});if(!restart.ok)throw Error('重啟紀錄讀取失敗');
+   page=await restart.json();
+  }
+  boot=page.boot;
+  if(cursor&&page.oldest>cursor+1)missed+=page.oldest-cursor-1;
+  for(const row of page.rows){if(row.seq<=cursor)continue;records.push(row);renderRow(row);cursor=row.seq;}
+  while(records.length>2000){records.shift();el('rows').firstChild.remove();clientDropped++;}
+  more=cursor<page.latest;
+  el('connection').textContent='已連線 · 開機識別 '+boot;
+  el('notice').textContent='裝置最近 128 筆；重啟清空。裝置已覆寫 '+page.overwritten+' 筆；本頁漏接 '+missed+
+    ' 筆；本頁超出 2000 筆已移除 '+clientDropped+' 筆。下載包含目前本頁保留紀錄。';
+  if(!paused)el('view').scrollTop=el('view').scrollHeight;
+ }catch(error){el('connection').textContent='連線失敗：'+error.message;}
+ setTimeout(update,more?100:750);
+}
+el('pause').onclick=()=>{paused=!paused;el('pause').textContent=paused?'恢復自動捲動':'暫停自動捲動';};
+el('download').onclick=()=>{
+ const blob=new Blob([JSON.stringify({boot,missed,clientDropped,records},null,2)],{type:'application/json'});
+ const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='litter-log-'+boot+'.json';
+ a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+update();
 </script></body></html>)rawliteral";
 
 void serviceDebugServer() {
@@ -785,6 +912,14 @@ void startDebugServer() {
   debugServer.on("/api/status", HTTP_GET, []() {
     debugServer.sendHeader("Cache-Control", "no-store");
     debugServer.send(200, "application/json; charset=utf-8", debugStatusJson());
+  });
+  debugServer.on("/api/logs", HTTP_GET, []() {
+    uint32_t after = 0;
+    if (debugServer.hasArg("after") && !parseDecimal(debugServer.arg("after"), after)) {
+      debugServer.send(400, "text/plain; charset=utf-8", "無效的紀錄序號"); return;
+    }
+    debugServer.sendHeader("Cache-Control", "no-store");
+    debugServer.send(200, "application/json; charset=utf-8", debugLogJson(after));
   });
   debugServer.onNotFound([]() { debugServer.send(404, "text/plain; charset=utf-8", "找不到頁面"); });
   debugServer.begin();
@@ -845,6 +980,8 @@ void finishSession() {
   }
   Serial.printf("EVENT reason=%s saved_state=%s lost=%lu\n", recentReason.c_str(), recentState.c_str(),
     static_cast<unsigned long>(failedRecords));
+  logEvent("事件結案", completed.session_id.c_str(), visit.scanGeneration, completed.chip_id.c_str(),
+    completed.cat_id.c_str(), -1, (recentReason + " · " + recentState).c_str());
   rfidOff();
   visit.release();
   resetSession();
@@ -858,6 +995,8 @@ void processStateMachine() {
     const uint16_t d = readDistanceMm();
     const Visit::Phase previousPhase = visit.phase;
     visit.sample(millis(), d != UINT16_MAX, d);
+    if (previousPhase != visit.phase) logEvent("動作判定", currentSession.session_id.c_str(), visit.scanGeneration,
+      currentSession.chip_id.c_str(), currentSession.cat_id.c_str(), d == UINT16_MAX ? -1 : d, stateName(visit.phase));
     if (previousPhase == Visit::Phase::Idle && visit.candidate()) {
       candidateStartUtc = timeIsValid() ? time(nullptr) : 0;
       candidateFirstDistance = d;
@@ -883,6 +1022,7 @@ void processStateMachine() {
 
 void setup() {
   Serial.begin(115200);
+  logBootId = String(esp_random(), HEX);
   pinMode(Config::RFID_ENABLE_PIN, OUTPUT);
   rfidOff();
   pinMode(Config::TOF_INT_PIN, INPUT_PULLUP);
