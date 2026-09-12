@@ -141,12 +141,6 @@ bool isRegisteredChip(const String &chipId) {
          (CAT_2_CHIP_RAW[0] != '\0' && chipId == CAT_2_CHIP_RAW);
 }
 
-void rfidOff() {
-  digitalWrite(Config::RFID_ENABLE_PIN, LOW);
-  rfidEnabled = false;
-  rfidScanActive = false;
-}
-
 void rfidOn() {
   digitalWrite(Config::RFID_ENABLE_PIN, HIGH);
   rfidEnabled = true;
@@ -209,7 +203,6 @@ bool parseRfidFrame(const String &frame, String &chipId) {
 
 void syncRfidScan() {
   if (visit.scanGeneration != seenScanGeneration) {
-    rfidOff();
     seenScanGeneration = visit.scanGeneration;
     // Bytes already buffered belong to the previous window, never this scan.
     rfidStaleBytes = rfidSerial.available();
@@ -221,10 +214,8 @@ void syncRfidScan() {
       currentSession.session_id.c_str(), visit.scanGeneration, "", currentSession.cat_id.c_str(),
       latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm, "距離觸發");
     scanLogOpen = true;
-    if (visit.scanning) rfidOn();
   }
   rfidScanActive = visit.scanning;
-  if (!visit.scanning && rfidEnabled) rfidOff();
   switch (visit.scanResult) {
     case Visit::ScanResult::Scanning: rfidLastStatus = "掃描中"; break;
     case Visit::ScanResult::Valid: rfidLastStatus = visit.conflict ? "有效晶片與事件身分衝突" : "已取得有效晶片"; break;
@@ -1028,7 +1019,7 @@ void finishSession() {
     static_cast<unsigned long>(failedRecords));
   logEvent("事件結案", completed.session_id.c_str(), visit.scanGeneration, completed.chip_id.c_str(),
     completed.cat_id.c_str(), -1, (recentReason + " · " + recentState).c_str());
-  rfidOff();
+  rfidScanActive = false;
   visit.release();
   resetSession();
 }
@@ -1070,10 +1061,12 @@ void setup() {
   Serial.begin(115200);
   logBootId = String(esp_random(), HEX);
   pinMode(Config::RFID_ENABLE_PIN, OUTPUT);
-  rfidOff();
+  // Match the standalone reader: enable continuously, settle, then receive.
+  rfidOn();
+  delay(200);
+  rfidSerial.begin(9600, SERIAL_8N1, Config::RFID_RX_PIN, -1);
   pinMode(Config::TOF_INT_PIN, INPUT_PULLUP);
   WiFi.mode(WIFI_OFF);
-  rfidSerial.begin(9600, SERIAL_8N1, Config::RFID_RX_PIN, Config::RFID_TX_PIN);
   if (!prefs.begin("litter", false)) {
     journalWritable = false;
     storageFailure("NVS 開啟失敗，無法確認舊紀錄");

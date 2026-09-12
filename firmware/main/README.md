@@ -36,7 +36,7 @@ ESP32 RAM 保留最近 128 筆，重新整理可讀回，重啟清空；覆寫�
 
 `debug_log.h` 提供固定容量、跨執行緒保護的 RAM 紀錄；`/api/logs?after=序號` 每頁最多回傳 16 筆。後端 Sheets 格式與進出計時不受 log 功能影響。
 
-UART 在掃描窗口內外都持續處理，每次最多接收 96 bytes，並在距離／網頁服務前先接收。RFID 模組仍只在候選掃描時啟用，不是常開模式。開始掃描不再清空 UART：既有緩衝資料及跨窗口封包只供診斷，不建立事件、不借給下一輪；在軟體處理時已到掃描期限的封包也不採用，因為沒有硬體接收時間戳可證明其到達時間。
+UART 在掃描窗口內外都持續處理，每次最多接收 96 bytes，並在距離／網頁服務前先接收。RFID 啟動流程對齊獨立測試版：ON/OFF 設 HIGH，等待 200ms，再以 9600 8N1、RX=GPIO44、TX=-1 初始化 UART1。模組持續啟用，候選掃描結束、逾時及事件結案都不關閉；GPIO43 接線可保留，但 RFID UART 不配置傳送腳位。常開比按需啟用耗電較高；「掃描窗口」僅控制事件是否採用晶片，不控制模組電源。開始掃描不清空 UART：既有緩衝資料及跨窗口封包只供診斷，不建立事件、不借給下一輪；在軟體處理時已到掃描期限的封包也不採用，因為沒有硬體接收時間戳可證明其到達時間。
 
 LAN log 在解析前以最多 16 bytes 一列保留 HEX 與可讀文字，標示窗口內或窗口外／舊資料；有效窗口外封包顯示 ID 與貓名，但不影響身分判定。掃描結束列出接收量、無效計數及尚未完成的封包長度，超長與被新起始符取代的半包另列原因。原始 UART 僅在本機除錯日誌公開，不送往 Sheets；雜訊或大量資料仍可能使 128 筆 RAM 日誌覆寫，應及時下載。
 
@@ -82,7 +82,7 @@ ESP32 RAM retains the latest 128 rows across page refreshes, but not device rest
 
 `debug_log.h` provides the fixed-capacity, thread-protected RAM log; `/api/logs?after=sequence` returns up to 16 rows per page. Logging leaves the Sheets schema and visit timing unchanged.
 
-UART is serviced inside and outside scan windows, up to 96 bytes per pass, including before distance/web service. The reader itself remains enabled only for candidate scans, not continuously powered on. Starting a scan no longer drains UART: existing backlog and cross-window frames are diagnostic only and cannot create events or carry identity into the next scan. Frames processed at or after the deadline are also excluded because hardware arrival timestamps are unavailable.
+UART is serviced inside and outside scan windows, up to 96 bytes per pass, including before distance/web service. Startup matches the standalone reader: set ON/OFF HIGH, wait 200ms, then initialize UART1 at 9600 8N1 with RX=GPIO44 and TX=-1. The reader stays enabled after scan completion, timeout and event closure. GPIO43 wiring may remain, but the RFID UART does not assign a transmit pin. Continuous operation consumes more power than on-demand activation; scan windows control identity acceptance, not reader power. Starting a scan does not drain UART: existing backlog and cross-window frames are diagnostic only and cannot create events or carry identity into the next scan. Frames processed at or after the deadline are also excluded because hardware arrival timestamps are unavailable.
 
 Before parsing, the LAN log records HEX and printable text in rows of up to 16 bytes, labeled in-window or outside/stale. Valid outside-window frames show their ID and cat without affecting event identity. Scan summaries retain byte and invalid-frame counts plus the unfinished frame length; oversized frames and partial frames replaced by a new start marker have explicit diagnostics. Raw UART stays in local debug logs, never Sheets. Noise or heavy traffic can still overwrite the 128-row RAM ring; download promptly.
 
