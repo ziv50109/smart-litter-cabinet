@@ -10,22 +10,17 @@ The current design uses RFID and ToF. Camera-based recognition is an archived ex
 
 ```mermaid
 flowchart TD
-    Battery[503450 LiPo] --> Boost[MT3608 boosts to 5V]
-    Boost -->|USB-C| ESP32[XIAO ESP32-S3]
-    ESP32 -->|Board 5V| RFID[XY_134.2K RFID]
-    ESP32 -->|Board 3.3V| ToF[VL53L0X]
-    ToF -->|First reading below 200mm| Candidate[Candidate scan: no event yet]
-    Candidate -->|Registered chip| Entry[Entry activity: anchor event to first blockage]
-    Candidate -->|Unregistered chip or scan timeout| DropCandidate[Discard and wait for entrance recovery]
-    Entry -->|Continuously valid clear for 10s| Inside[Presumed inside: retain identity]
-    Inside -->|Below 200mm again| Exit[Exit candidate: scan RFID again]
-    Exit -->|Clear for 10s and scan complete| Close[Completed snapshot]
-    Entry -->|No exit candidate by 90s| Close
-    Inside -->|No exit candidate by 90s| Close
-    Exit -->|Still unconfirmed at 100s| Close
-    Close -->|Identity conflict| Drop[Discard without upload]
-    Close -->|No conflict| Queue[NVS pending queue]
-    Queue --> Worker[Background HTTPS delivery to Google Sheets]
+    Power[Battery → MT3608 5V → XIAO ESP32-S3] --> Sensors[VL53L0X distance + XY-134.2K RFID]
+    Sensors -->|First reading below 200mm| Visit[RAM provisional visit + entry RFID scan]
+    Visit -->|Clear for 10 seconds| Inside[Presumed inside]
+    Inside -->|Next reading below 200mm| Exit[Exit RFID scan]
+    Exit -->|Clear for 10 seconds| Resolve[Resolve visit]
+    Visit -->|No exit candidate by 5 minutes| Resolve
+    Inside -->|No exit candidate by 5 minutes| Resolve
+    Exit -->|Still unresolved at 5m10s| Resolve
+    Resolve -->|At least one registered ID and no conflict| Queue[Save and queue]
+    Resolve -->|No registered ID or conflicting IDs| Discard[Discard locally]
+    Queue --> Sheets[Background HTTPS → Google Sheets]
 ```
 
 ## Structure
@@ -44,7 +39,7 @@ Sensitive configuration is injected locally: `secrets.example.h` defines the int
 
 - Main system: the revised event logic still requires hardware validation; compilation and simulation do not establish real cat-visit accuracy.
 - Debug dashboard: the optional LAN page retains timestamped scan and upload logs with full chip IDs and cat names, alongside live distance and UART status. See [firmware debugging](firmware/main/README.md).
-- RFID identification: only the two locally registered cats can create events. Unregistered chips are rejected immediately, entry misses create no record, and exit misses preserve an established identity. See [firmware rules](firmware/main/README.md).
+- RFID identification: distance creates a RAM-only provisional visit. Either the entry or exit scan can attach one of the two registered cats; no identity or conflicting identities are discarded, never uploaded as `unknown`. See [firmware rules](firmware/main/README.md).
 - VL53L0X: standalone web distance test is under `firmware/tests/`
 - RFID: a 130mm coil reads the implanted 2×12mm FDX-B chip at approximately 10–13cm in the installed test environment
 - Vision: archived and not part of the current MVP

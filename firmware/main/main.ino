@@ -222,7 +222,7 @@ void syncRfidScan() {
     case Visit::ScanResult::Rejected: rfidLastStatus = "未登錄晶片，已立即拒絕"; break;
     case Visit::ScanResult::Timeout:
       rfidLastStatus = visit.chip[0] ? "10秒內未取得有效封包，保留事件身分"
-                                     : "10秒內未取得已登錄晶片，未建立事件";
+                                     : "10秒內未取得已登錄晶片，保留RAM暫定事件";
       break;
     case Visit::ScanResult::Cancelled: rfidLastStatus = "事件期限到，保留事件身分"; break;
     default: rfidLastStatus = "尚未掃描";
@@ -286,30 +286,30 @@ void pollRfidScan(bool advanceClock = true) {
         rfidLastRaw = "窗口外有效封包（晶片已遮罩）";
       } else if (validFrame && isRegisteredChip(chipId)) {
         const bool wasCandidate = visit.candidate();
+        const bool hadIdentity = visit.chip[0] != 0;
         if (!visit.acceptChip(millis(), chipId.c_str())) {
           ++rfidInvalidFrames;
           rfidLastRaw = "有效封包但掃描已結束";
           rfidReceiving = false;
           continue;
         }
-        if (wasCandidate) beginSession(candidateFirstDistance);
         currentSession.chip_id = visit.chip;
         currentSession.cat_id = catNameForChip(currentSession.chip_id);
         logEvent("收到 RFID", currentSession.session_id.c_str(), visit.scanGeneration,
           chipId.c_str(), catNameForChip(chipId).c_str(), latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm,
           visit.conflict ? "兩隻已登錄貓身分衝突" : "已登錄晶片");
-        if (wasCandidate) logEvent("建立進入事件", currentSession.session_id.c_str(), visit.scanGeneration,
+        if (!hadIdentity) logEvent(wasCandidate ? "確認進入身分" : "離開補登身分",
+          currentSession.session_id.c_str(), visit.scanGeneration,
           currentSession.chip_id.c_str(), currentSession.cat_id.c_str(), latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm,
-          "事件起點採首次入口遮擋");
+          wasCandidate ? "暫定事件轉為已辨識事件；起點採首次入口遮擋"
+                       : "使用離開掃描結果回填暫定事件；起點採首次入口遮擋");
         rfidLastRaw = "有效封包（晶片已遮罩）";
         checkpointActiveSession();
         Serial.printf("RFID valid=yes identity_retained=yes conflict=%s\n", visit.conflict ? "yes" : "no");
       } else if (validFrame && visit.rejectChip(millis(), chipId.c_str())) {
         logEvent("未登錄晶片立即拒絕", currentSession.session_id.c_str(), visit.scanGeneration,
           chipId.c_str(), "未登錄", latestDistanceMm == UINT16_MAX ? -1 : latestDistanceMm,
-          visit.active() ? "離開干擾，保留事件貓咪" : "入口候選取消，不建立事件");
-        candidateStartUtc = 0;
-        candidateFirstDistance = UINT16_MAX;
+          visit.chip[0] ? "干擾已忽略，保留事件貓咪" : "未確認身分，RAM暫定事件繼續");
         rfidLastRaw = "未登錄晶片（已拒絕，不公開原文）";
         Serial.println("RFID registered=no action=rejected");
       } else {
@@ -708,7 +708,8 @@ void storageFailure(const char *message) {
 }
 
 bool checkpointActiveSession() {
-  if (!journalWritable || !visit.active() || !currentSession.session_id.length()) return false;
+  if (!journalWritable || !visit.active() || !currentSession.session_id.length() ||
+      !isRegisteredChip(currentSession.chip_id)) return false;
   // Journal is diagnostic only after reboot: never replay it as a completed visit.
   SessionRecord snapshot = currentSession;
   snapshot.duration_sec = max(1UL, visit.elapsed(millis()) / 1000UL);
@@ -1060,6 +1061,7 @@ void processStateMachine() {
     if (previousPhase == Visit::Phase::Idle && visit.candidate()) {
       candidateStartUtc = timeIsValid() ? time(nullptr) : 0;
       candidateFirstDistance = d;
+      beginSession(candidateFirstDistance);
     } else if (previousPhase == Visit::Phase::Candidate && !visit.candidate()) {
       candidateStartUtc = 0;
       candidateFirstDistance = UINT16_MAX;

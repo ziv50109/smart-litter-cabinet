@@ -44,7 +44,7 @@ struct Engine {
     if (scanning && uint32_t(now - scanStarted) >= Config::RFID_TIMEOUT_MS) {
       scanning = false; scanResult = ScanResult::Timeout;
       if (phase == Phase::Candidate)
-        phase = Phase::WaitClear;
+        phase = Phase::Entry;
     }
     if (!active()) return;
     if (phase != Phase::Exit && elapsed(now) >= Config::MAX_SESSION_DURATION_MS)
@@ -101,7 +101,7 @@ struct Engine {
                clearElapsed(now) >= Config::CLEAR_INTERVAL_MS && !scanning) {
       finish(now, Reason::Normal);
     }
-    tick(now); // At exactly 100s, a fresh normal confirmation wins; otherwise force closure.
+    tick(now); // At exactly 5m10s, a fresh normal confirmation wins; otherwise force closure.
   }
   bool acceptChip(uint32_t now, const char *value) {
     tick(now);
@@ -120,7 +120,7 @@ struct Engine {
     memcpy(scanChip, value, 16);
     scanning = false; scanResult = ScanResult::Rejected;
     if (phase == Phase::Candidate)
-      phase = hasFreshClear(now) ? Phase::Idle : Phase::WaitClear;
+      phase = Phase::Entry;
     return true;
   }
   uint32_t durationMs() const {

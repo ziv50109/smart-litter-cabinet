@@ -23,7 +23,7 @@ constexpr uint32_t NTP_TIMEOUT_MS = 10000;
 constexpr uint32_t TOF_INVALID_RESTART_MS = 5000;
 constexpr uint32_t TOF_REINIT_BACKOFF_MS = 5000;
 constexpr uint32_t SESSION_CHECKPOINT_MS = 30000;
-constexpr uint32_t MAX_SESSION_DURATION_MS = 90000;
-constexpr uint32_t EXIT_FINAL_DEADLINE_MS = 100000;
+constexpr uint32_t MAX_SESSION_DURATION_MS = 300000;
+constexpr uint32_t EXIT_FINAL_DEADLINE_MS = 310000;
 constexpr uint8_t MAX_PENDING_RECORDS = 8;
 }  // namespace Config

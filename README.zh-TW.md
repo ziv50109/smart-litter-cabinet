@@ -10,22 +10,17 @@
 
 ```mermaid
 flowchart TD
-    Battery[503450 鋰電池] --> Boost[MT3608 升壓至 5V]
-    Boost -->|USB-C| ESP32[XIAO ESP32-S3]
-    ESP32 -->|板上 5V| RFID[XY_134.2K RFID]
-    ESP32 -->|板上 3.3V| ToF[VL53L0X]
-    ToF -->|首次小於 200mm| Candidate[候選掃描：尚未建立事件]
-    Candidate -->|已登錄晶片| Entry[入口活動：以首次遮擋建立事件]
-    Candidate -->|未登錄晶片或掃描逾時| DropCandidate[放棄並等待入口恢復]
-    Entry -->|連續有效清空 10 秒| Inside[推定在內部：保留身分]
-    Inside -->|再次小於 200mm| Exit[離開候選：再次掃 RFID]
-    Exit -->|連續清空 10 秒且掃描完成| Close[結案快照]
-    Entry -->|90 秒沒有離開候選| Close
-    Inside -->|90 秒沒有離開候選| Close
-    Exit -->|100 秒仍未確認| Close
-    Close -->|身分衝突| Drop[捨棄，不上傳]
-    Close -->|無衝突| Queue[NVS 待傳佇列]
-    Queue --> Worker[背景 HTTPS 上傳至 Google Sheets]
+    Power[鋰電池 → MT3608 5V → XIAO ESP32-S3] --> Sensors[VL53L0X 距離 + XY-134.2K RFID]
+    Sensors -->|首次距離小於 200mm| Visit[RAM 暫定事件 + 入口 RFID 掃描]
+    Visit -->|清空持續 10 秒| Inside[推定在內部]
+    Inside -->|下次距離小於 200mm| Exit[離開 RFID 掃描]
+    Exit -->|清空持續 10 秒| Resolve[判定事件]
+    Visit -->|5 分鐘內未建立離開候選| Resolve
+    Inside -->|5 分鐘內未建立離開候選| Resolve
+    Exit -->|5 分 10 秒仍未完成| Resolve
+    Resolve -->|至少一個已登錄 ID 且無衝突| Queue[保存並排入佇列]
+    Resolve -->|沒有已登錄 ID 或身分衝突| Discard[本機作廢]
+    Queue --> Sheets[背景 HTTPS → Google Sheets]
 ```
 
 ## 目錄
@@ -44,7 +39,7 @@ flowchart TD
 
 - 主系統：事件判定修訂的實機驗證仍待進行；編譯與模擬不代表已驗證貓咪真實進出。
 - 除錯頁：區域網路頁面保留掃描與上傳的時間序列 log，顯示完整晶片 ID、貓咪、即時距離及 UART 狀態；詳見[主韌體除錯說明](firmware/main/README.md)。
-- RFID 辨識：只有本機已登錄的兩隻貓能建立事件；未登錄晶片立即拒絕，入口漏讀不建立紀錄，正式事件的離開漏讀保留原身分。完整規則見 [主韌體說明](firmware/main/README.md)。
+- RFID 辨識：距離先建立只存在 RAM 的暫定事件；入口或離開任一側掃到本機已登錄貓咪即可補上身分。兩側都漏讀或身分衝突會作廢，絕不上傳 `unknown`。完整規則見 [主韌體說明](firmware/main/README.md)。
 - VL53L0X：獨立網頁測距程式已收入 `firmware/tests/`
 - RFID：130mm 線圈在實際環境中可隔著貓咪皮膚讀取 2×12mm FDX-B 晶片，實測距離約 10–13cm
 - Vision：歸檔，現階段不繼續開發
