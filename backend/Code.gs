@@ -37,8 +37,8 @@ const PREVIOUS_SHEET_HEADERS = [
 const MAX_BODY_BYTES = 4096;
 const SHEET_TIME_ZONE = 'Asia/Taipei';
 const SHEET_DATETIME_FORMAT = 'yyyy/MM/dd HH:mm:ss';
-const SHEET_DURATION_FORMAT = '[m]:ss';
-const SHEET_MIGRATION_PREFIX = 'SHEET_FORMAT_V2_';
+const SHEET_DURATION_FORMAT = '[mm]:ss';
+const SHEET_MIGRATION_PREFIX = 'SHEET_FORMAT_V3_';
 const ALLOWED_TOP_LEVEL_KEYS = new Set(['device_token', 'session']);
 const ALLOWED_SESSION_KEYS = new Set(FIELD_KEYS);
 
@@ -124,45 +124,67 @@ function isStoredIsoTime_(value) {
     Number.isFinite(Date.parse(value));
 }
 
-function migrateSheetValues_(sheet, spreadsheetId) {
+function formatTimeColumns_(sheet, startRow, rowCount) {
+  sheet.getRange(startRow, 4, rowCount, 2).setNumberFormat(SHEET_DATETIME_FORMAT);
+  sheet.getRange(startRow, 6, rowCount, 1).setNumberFormat(SHEET_DURATION_FORMAT);
+}
+
+function durationMigrationValues_(range, fromSeconds) {
+  const values = range.getValues();
+  const formulas = range.getFormulas();
+  const formats = range.getNumberFormats();
+  let changed = false;
+  const migrated = values.map((row, index) => {
+    const value = row[0];
+    const formula = formulas[index][0];
+    if (formula && /^=\d+\/86400$/.test(formula)) return [formula];
+    if (value === '' && formula === '') return [''];
+    if (!fromSeconds) {
+      // Earlier, fully migrated revisions used [m]:ss. Never infer units from magnitude.
+      if (!/^\[m+\]:ss$/i.test(formats[index][0])) {
+        throw new Error('ambiguous_stored_duration');
+      }
+      return [formula || value];
+    }
+    // A self-contained formula retains the original seconds and the unit conversion
+    // in the SAME cell write. Retries preserve it, even after a partial batch write.
+    if (formula) throw new Error('ambiguous_stored_duration');
+    integer_(value, 'stored_duration', 0, 86400);
+    changed = true;
+    return ['=' + value + '/86400'];
+  });
+  return changed ? migrated : null;
+}
+
+function migrateSheetValues_(sheet, spreadsheetId, durationsAreSeconds) {
   const props = PropertiesService.getScriptProperties();
-  const migrationKey = SHEET_MIGRATION_PREFIX + spreadsheetId;
+  const migrationKey = SHEET_MIGRATION_PREFIX + spreadsheetId + '_' + sheet.getSheetId();
   if (props.getProperty(migrationKey) === 'done') return;
 
   const lastRow = sheet.getLastRow();
   if (lastRow > 1) {
+    const durationRange = sheet.getRange(2, 6, lastRow - 1, 1);
+    const durationValues = durationMigrationValues_(durationRange, durationsAreSeconds);
     const timeRange = sheet.getRange(2, 4, lastRow - 1, 2);
     const timeValues = timeRange.getValues();
+    const timeFormulas = timeRange.getFormulas();
     let timeChanged = false;
-
-    timeValues.forEach(row => {
-      for (let index = 0; index < row.length; index++) {
-        if (isStoredIsoTime_(row[index])) {
-          row[index] = new Date(row[index]);
-          timeChanged = true;
-        }
+    const migratedTimes = timeValues.map((row, rowIndex) => row.map((value, colIndex) => {
+      if (timeFormulas[rowIndex][colIndex]) return timeFormulas[rowIndex][colIndex];
+      if (isStoredIsoTime_(value)) {
+        timeChanged = true;
+        return new Date(value);
       }
-    });
+      return safeCell_(value);
+    }));
 
-    if (timeChanged) timeRange.setValues(timeValues);
-    timeRange.setNumberFormat(SHEET_DATETIME_FORMAT);
-
-    const durationRange = sheet.getRange(2, 6, lastRow - 1, 1);
-    const durationValues = durationRange.getValues();
-    let durationChanged = false;
-
-    durationValues.forEach(row => {
-      const value = row[0];
-      if (typeof value === 'number' && Number.isFinite(value) && value >= 1) {
-        row[0] = value / 86400;
-        durationChanged = true;
-      }
-    });
-
-    if (durationChanged) durationRange.setValues(durationValues);
-    durationRange.setNumberFormat(SHEET_DURATION_FORMAT);
+    if (timeChanged) timeRange.setValues(migratedTimes);
+    if (durationValues) durationRange.setValues(durationValues);
+    formatTimeColumns_(sheet, 2, lastRow - 1);
   }
 
+  // Commit pending spreadsheet writes before marking this specific sheet complete.
+  SpreadsheetApp.flush();
   props.setProperty(migrationKey, 'done');
 }
 
@@ -181,6 +203,7 @@ function ensureSheet_(spreadsheetId) {
   }
 
   const sheet = spreadsheet.getSheets()[0];
+  let migrateHeaders = false;
   if (sheet.getLastRow() === 0) {
     sheet.appendRow(SHEET_HEADERS);
   } else {
@@ -188,14 +211,16 @@ function ensureSheet_(spreadsheetId) {
     const isLegacySchema = actualHeaders.every((value, index) => value === FIELD_KEYS[index]);
     const isPreviousSchema = actualHeaders.every((value, index) => value === PREVIOUS_SHEET_HEADERS[index]);
     if ((isLegacySchema || isPreviousSchema) && sheet.getLastColumn() === FIELD_KEYS.length) {
-      sheet.getRange(1, 1, 1, SHEET_HEADERS.length).setValues([SHEET_HEADERS]);
+      migrateHeaders = true;
     } else if (sheet.getLastColumn() !== SHEET_HEADERS.length ||
         actualHeaders.some((value, index) => value !== SHEET_HEADERS[index])) {
       throw new Error('invalid_sheet_schema');
     }
   }
 
-  migrateSheetValues_(sheet, spreadsheetId);
+  migrateSheetValues_(sheet, spreadsheetId, migrateHeaders);
+  // Keep the old unit-bearing header until all values and formats are durable.
+  if (migrateHeaders) sheet.getRange(1, 1, 1, SHEET_HEADERS.length).setValues([SHEET_HEADERS]);
   return sheet;
 }
 
@@ -240,14 +265,15 @@ function doPost(e) {
           .matchEntireCell(true)
           .findNext();
         if (duplicate) {
+          formatTimeColumns_(sheet, duplicate.getRow(), 1);
+          SpreadsheetApp.flush();
           return jsonResponse_({ok: true, duplicate: true});
         }
       }
 
       sheet.appendRow(FIELD_KEYS.map(key => sheetValue_(key, row[key])));
-      const insertedRow = sheet.getLastRow();
-      sheet.getRange(insertedRow, 4, 1, 2).setNumberFormat(SHEET_DATETIME_FORMAT);
-      sheet.getRange(insertedRow, 6).setNumberFormat(SHEET_DURATION_FORMAT);
+      formatTimeColumns_(sheet, sheet.getLastRow(), 1);
+      SpreadsheetApp.flush();
     } finally {
       lock.releaseLock();
     }
