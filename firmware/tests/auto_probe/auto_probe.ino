@@ -87,6 +87,8 @@ bool sampled = false;
 bool gotByte = false;
 bool tofReady = false;
 bool portalStarted = false;
+bool routesRegistered = false;
+bool startRequested = false;
 bool havePreviousSample = false;
 bool otaStarted = false;
 bool otaFailed = false;
@@ -95,6 +97,9 @@ uint32_t poweredAt = 0;
 uint32_t seenGeneration = 0;
 Sample previousSample{};
 Probe::End seenEnd = Probe::End::None;
+
+void startRun();
+void startPortal();
 
 void addEvent(uint16_t code, uint16_t value = 0, uint32_t aux = 0) {
   if (capture.eventCount >= EVENT_CAP) {
@@ -196,36 +201,47 @@ const char *catLabel(uint16_t cat) {
   return "未辨識";
 }
 
-String summaryHtml() {
+String pageHtml() {
+  const bool hasResult = capture.ended != 0;
   const uint16_t cat = lastRecognizedCat();
   String html;
-  html.reserve(6500);
+  html.reserve(7000);
   html += F("<!doctype html><html lang='zh-Hant'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<style>body{font-family:system-ui;margin:20px;line-height:1.55}table{border-collapse:collapse;width:100%;max-width:760px}td,th{border:1px solid #bbb;padding:7px;text-align:left}button,input,a{font-size:16px;padding:10px 14px;margin:8px 4px 8px 0}.box{border:1px solid #bbb;padding:14px;max-width:760px;margin-top:18px}</style>");
-  html += F("<h1>LitterProbe 測試結果</h1>");
-  html += F("<p><b>測試期間 Wi-Fi 是關閉的。</b>現在這個 Wi-Fi 是測試結束後才開啟，所以不會污染本次待機/RFID 測量。</p>");
-  html += F("<table><tr><th>項目</th><th>結果</th></tr>");
-  html += F("<tr><td>入口是否觸發 &lt;200mm</td><td>"); html += capture.trigger ? "是" : "否（15 分鐘內沒有觸發）"; html += F("</td></tr>");
-  html += F("<tr><td>辨識貓咪</td><td>"); html += catLabel(cat); html += F("</td></tr>");
-  html += F("<tr><td>RFID 掃描窗口</td><td>"); html += capture.scans; html += F("</td></tr>");
-  html += F("<tr><td>成功辨識窗口</td><td>"); html += capture.recognized; html += F("</td></tr>");
-  html += F("<tr><td>RFID GPIO HIGH 累積</td><td>"); html += capture.onMs; html += F(" ms</td></tr>");
-  html += F("<tr><td>UART bytes / 壞封包</td><td>"); html += capture.bytes; html += " / "; html += capture.badFrames; html += F("</td></tr>");
-  html += F("<tr><td>測距 samples / invalid</td><td>"); html += capture.samplesSeen; html += " / "; html += capture.invalidSamples; html += F("</td></tr>");
-  html += F("<tr><td>最大取樣間隔</td><td>"); html += capture.maxGap; html += F(" ms</td></tr>");
-  html += F("<tr><td>Light-sleep</td><td>"); html += capture.sleepCalls; html += F(" 次 / "); html += capture.sleepMs; html += F(" ms / errors "); html += capture.sleepErrors; html += F("</td></tr>");
-  html += F("<tr><td>Sensor failed</td><td>"); html += capture.sensorFailed; html += F("</td></tr>");
-  html += F("<tr><td>Trace drops</td><td>samples "); html += capture.sampleDrops; html += F(" / events "); html += capture.eventDrops; html += F("</td></tr></table>");
-  html += F("<p><a href='/raw'>查看完整原始紀錄</a></p>");
-  html += F("<form method='post' action='/rerun'><button type='submit'>重新測一次</button></form>");
-  html += F("<p>重新測試後 Wi-Fi 會立刻消失；最長等待 15 分鐘。第一次 &lt;200mm 後再記錄 60 秒，結束後 LitterProbe Wi-Fi 會重新出現。</p>");
-  html += F("<div class='box'><h2>無線更新韌體</h2><p>只選 Arduino 匯出的 <code>*.ino.bin</code> application image。更新成功後裝置會自動重新啟動。</p>");
+  html += F("<h1>LitterProbe</h1>");
+  html += F("<div class='box'><h2>低功耗 / RFID 驗證</h2>");
+  if (!hasResult) {
+    html += F("<p>目前是維護模式：RFID 關閉，尚未開始測試。按下開始後 Wi-Fi 會消失；測試期間 Wi-Fi 完全關閉。</p>");
+  } else {
+    html += F("<p><b>上一輪測試期間 Wi-Fi 是關閉的。</b>目前 Wi-Fi 是測試完成後重新開啟。</p>");
+  }
+  html += F("<form method='post' action='/start'><button type='submit'>開始低功耗測試</button></form>");
+  html += F("<p>開始後最長等待 15 分鐘；第一次有效 &lt;200mm 後記錄 60 秒，完成後 LitterProbe Wi-Fi 會自動重新出現。</p></div>");
+
+  if (hasResult) {
+    html += F("<h2>上一輪測試結果</h2><table><tr><th>項目</th><th>結果</th></tr>");
+    html += F("<tr><td>入口是否觸發 &lt;200mm</td><td>"); html += capture.trigger ? "是" : "否（15 分鐘內沒有觸發）"; html += F("</td></tr>");
+    html += F("<tr><td>辨識貓咪</td><td>"); html += catLabel(cat); html += F("</td></tr>");
+    html += F("<tr><td>RFID 掃描窗口</td><td>"); html += capture.scans; html += F("</td></tr>");
+    html += F("<tr><td>成功辨識窗口</td><td>"); html += capture.recognized; html += F("</td></tr>");
+    html += F("<tr><td>RFID GPIO HIGH 累積</td><td>"); html += capture.onMs; html += F(" ms</td></tr>");
+    html += F("<tr><td>UART bytes / 壞封包</td><td>"); html += capture.bytes; html += " / "; html += capture.badFrames; html += F("</td></tr>");
+    html += F("<tr><td>測距 samples / invalid</td><td>"); html += capture.samplesSeen; html += " / "; html += capture.invalidSamples; html += F("</td></tr>");
+    html += F("<tr><td>最大取樣間隔</td><td>"); html += capture.maxGap; html += F(" ms</td></tr>");
+    html += F("<tr><td>Light-sleep</td><td>"); html += capture.sleepCalls; html += F(" 次 / "); html += capture.sleepMs; html += F(" ms / errors "); html += capture.sleepErrors; html += F("</td></tr>");
+    html += F("<tr><td>Sensor failed</td><td>"); html += capture.sensorFailed; html += F("</td></tr>");
+    html += F("<tr><td>Trace drops</td><td>samples "); html += capture.sampleDrops; html += F(" / events "); html += capture.eventDrops; html += F("</td></tr></table>");
+    html += F("<p><a href='/raw'>查看完整原始紀錄</a></p>");
+  }
+
+  html += F("<div class='box'><h2>無線更新韌體</h2><p>只選 Arduino 匯出的 <code>*.ino.bin</code> application image。更新成功後 ESP32 會自動重新啟動。</p>");
   html += F("<form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin,application/octet-stream' required><button type='submit'>上傳並更新</button></form></div>");
   html += F("</html>");
   return html;
 }
 
 String rawText() {
+  if (!capture.ended) return "NO_CAPTURE\n";
   String out;
   out.reserve(22000);
   out += "SUMMARY\n";
@@ -248,26 +264,28 @@ String rawText() {
   return out;
 }
 
-void startResultPortal() {
-  if (portalStarted) return;
-  setReaderPower(false);
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("LitterProbe");
+void registerRoutes() {
+  if (routesRegistered) return;
 
   web.on("/", HTTP_GET, []() {
     web.sendHeader("Cache-Control", "no-store");
-    web.send(200, "text/html; charset=utf-8", summaryHtml());
+    web.send(200, "text/html; charset=utf-8", pageHtml());
   });
   web.on("/raw", HTTP_GET, []() {
     web.sendHeader("Cache-Control", "no-store");
     web.send(200, "text/plain; charset=utf-8", rawText());
   });
+  web.on("/start", HTTP_POST, []() {
+    if (running) {
+      web.send(409, "text/plain; charset=utf-8", "測試已在執行中。");
+      return;
+    }
+    web.send(200, "text/plain; charset=utf-8", "測試開始。Wi-Fi 即將關閉；完成後重新連線 LitterProbe 並開啟 http://192.168.4.1/");
+    startRequested = true;
+  });
   web.on("/rerun", HTTP_POST, []() {
-    web.send(200, "text/plain; charset=utf-8", "重新測試中；Wi-Fi 現在會消失。測試完成後重新連線 LitterProbe，開啟 http://192.168.4.1/");
-    delay(300);
-    WiFi.softAPdisconnect(true);
-    delay(100);
-    ESP.restart();
+    web.send(200, "text/plain; charset=utf-8", "測試開始。Wi-Fi 即將關閉；完成後重新連線 LitterProbe 並開啟 http://192.168.4.1/");
+    startRequested = true;
   });
   web.on("/update", HTTP_POST,
     []() {
@@ -299,8 +317,25 @@ void startResultPortal() {
       }
     });
   web.onNotFound([]() { web.send(404, "text/plain; charset=utf-8", "Not found"); });
+  routesRegistered = true;
+}
+
+void startPortal() {
+  if (portalStarted) return;
+  setReaderPower(false);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("LitterProbe");
+  registerRoutes();
   web.begin();
   portalStarted = true;
+}
+
+void stopPortal() {
+  if (!portalStarted) return;
+  web.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  portalStarted = false;
 }
 
 void finishRun(bool sensorFailed = false) {
@@ -311,7 +346,7 @@ void finishRun(bool sensorFailed = false) {
   if (sensorFailed) capture.sensorFailed = 1;
   running = false;
   reader.end();
-  startResultPortal();
+  startPortal();
 }
 
 void startRun() {
@@ -324,7 +359,6 @@ void startRun() {
   sampled = false;
   gotByte = false;
   tofReady = false;
-  portalStarted = false;
   havePreviousSample = false;
   otaStarted = false;
   otaFailed = false;
@@ -353,12 +387,20 @@ void startRun() {
 void setup() {
   pinMode(ENABLE_PIN, OUTPUT);
   digitalWrite(ENABLE_PIN, LOW);
-  startRun();
+  startPortal();
 }
 
 void loop() {
   if (!running) {
-    if (portalStarted) web.handleClient();
+    if (portalStarted) {
+      web.handleClient();
+      if (startRequested) {
+        startRequested = false;
+        delay(250);
+        stopPortal();
+        startRun();
+      }
+    }
     delay(5);
     return;
   }
