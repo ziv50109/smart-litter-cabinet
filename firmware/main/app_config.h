@@ -2,11 +2,11 @@
 #include <stdint.h>
 
 namespace Config {
-constexpr uint8_t RFID_ENABLE_PIN = 1;
-constexpr uint8_t TOF_INT_PIN = 2;
-constexpr uint8_t TOF_SDA_PIN = 5;
-constexpr uint8_t TOF_SCL_PIN = 6;
-constexpr uint8_t RFID_RX_PIN = 44;
+constexpr uint8_t RFID_ENABLE_PIN = 1;  // D0 / GPIO1, HIGH = XY-134.2K ON
+constexpr uint8_t TOF_INT_PIN = 2;      // D1 / GPIO2, reserved for future INT wake tuning
+constexpr uint8_t TOF_SDA_PIN = 5;      // D4 / GPIO5
+constexpr uint8_t TOF_SCL_PIN = 6;      // D5 / GPIO6
+constexpr uint8_t RFID_RX_PIN = 44;     // D7 / GPIO44 <- XY TXD
 
 constexpr uint16_t ENTRY_THRESHOLD_MM = 200;
 constexpr uint32_t IDLE_RANGING_PERIOD_MS = 200;
@@ -25,8 +25,7 @@ constexpr uint32_t WIFI_TIMEOUT_MS = 8000;
 constexpr uint32_t NTP_TIMEOUT_MS = 8000;
 constexpr uint32_t BOOT_MAINTENANCE_MS = 120000;
 constexpr uint32_t POST_EVENT_MAINTENANCE_MS = 60000;
-constexpr uint32_t RETRY_UPLOAD_AFTER_MS = 60000;
 constexpr uint8_t MAX_PENDING_RECORDS = 8;
 constexpr uint8_t TRACE_SLOTS = 8;
 constexpr uint32_t DIAG_ROTATE_BYTES = 65536;
-}
+}  // namespace Config
