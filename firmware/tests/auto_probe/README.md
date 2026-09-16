@@ -10,6 +10,7 @@
 4. 若 15 分鐘內都沒有 `<200mm`，以「未觸發」結束，仍可查看待機統計。
 5. 測試結束後才建立開放 Wi-Fi `LitterProbe`。手機連上後開 `http://192.168.4.1/` 看摘要；`/raw` 看完整 trace。
 6. 網頁「重新測一次」會重啟，Wi-Fi 立即消失，重新進入測試；完成後 `LitterProbe` 再出現。
+7. 結果頁提供 Web OTA。之後只要選 Arduino 匯出的 `*.ino.bin` application image，就能無線更新到另一個 OTA app slot，成功後自動重啟。
 
 ## 編譯
 
@@ -22,7 +23,7 @@ Copy-Item firmware/main/secrets.h firmware/tests/auto_probe/secrets.h
 
 Arduino IDE 開 `firmware/tests/auto_probe/auto_probe.ino`，板子選 XIAO ESP32-S3，Export Compiled Binary。
 
-## 手機燒錄
+## 最後一次手機 USB 燒錄
 
 只刷 application image；實際 offset 以該次 build 的 `flash_args` 為準。若仍是：
 
@@ -49,5 +50,17 @@ nrflash write --chip esp32s3 --offset 0x10000 /storage/emulated/0/Download/ESP32
 - 開 `http://192.168.4.1/`。
 
 結果頁顯示：是否觸發、辨識貓咪、掃描窗口、RFID GPIO HIGH 累積時間、UART bytes / 壞封包、測距 samples / invalid、最大取樣間隔、Light-sleep 次數/時間/錯誤及 trace drops。
+
+## 之後的 OTA 更新
+
+測試結束、`LitterProbe` 出現後：
+
+1. 手機連 `LitterProbe`。
+2. 開 `http://192.168.4.1/`。
+3. 在「無線更新韌體」選擇 Arduino 匯出的 `*.ino.bin`。
+4. 按「上傳並更新」。
+5. 成功後 ESP32 自動重啟。
+
+只上傳 application image；不要上傳 `merged.bin`、`bootloader.bin` 或 `partitions.bin`。目前 partition table 已有 OTA data、`ota_0`、`ota_1`，因此 application OTA 可用。
 
 這些是控制與時間診斷，不等於實際 mA。要確認真正續航仍需電流或電池續航實測。
