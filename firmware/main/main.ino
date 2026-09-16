@@ -11,6 +11,8 @@
 #include <esp_sleep.h>
 #include <esp_timer.h>
 #include <time.h>
+#include <stdlib.h>
+#include <math.h>
 #include "app_config.h"
 #include "visit_logic.h"
 #include "certificates.h"
@@ -71,6 +73,8 @@ uint32_t rfidPowerAt = 0, seenScanGeneration = 0;
 String rfidFrame;
 uint16_t latestDistance = UINT16_MAX;
 uint32_t lastRangeMs = 0;
+uint32_t invalidDistanceSinceMs = 0;
+uint32_t lastTofInitAttemptMs = 0;
 
 bool webRoutesReady = false, webRunning = false;
 enum class NetMode { Off, Sta, Ap };
@@ -211,10 +215,12 @@ void pollRfid() {
 }
 
 bool initTof() {
+  lastTofInitAttemptMs = millis();
   Wire.begin(Config::TOF_SDA_PIN, Config::TOF_SCL_PIN);
   Wire.setClock(400000);
   tof.setTimeout(100);
   tofReady = tof.init() && tof.setMeasurementTimingBudget(Config::TOF_TIMING_BUDGET_US);
+  logLive(tofReady ? "tof_ready" : "tof_init_failed");
   return tofReady;
 }
 uint16_t readDistance() {
@@ -222,6 +228,13 @@ uint16_t readDistance() {
   uint16_t mm = tof.readRangeSingleMillimeters();
   if (tof.timeoutOccurred() || mm == 0 || mm > 2000) return UINT16_MAX;
   return mm;
+}
+void handleInvalidDistance(uint32_t now) {
+  if (!invalidDistanceSinceMs) invalidDistanceSinceMs = now;
+  if (uint32_t(now - invalidDistanceSinceMs) < Config::TOF_INVALID_RESTART_MS) return;
+  if (uint32_t(now - lastTofInitAttemptMs) < Config::TOF_REINIT_BACKOFF_MS) return;
+  logLive("tof_reinit", "invalid for 5s");
+  if (initTof()) invalidDistanceSinceMs = 0;
 }
 
 String newSessionId() {
@@ -260,35 +273,126 @@ void metricsSample(uint32_t now, uint16_t mm) {
   traceSample(now, mm, mm != UINT16_MAX, mm != UINT16_MAX && mm < Config::ENTRY_THRESHOLD_MM);
 }
 
+uint32_t fnv1a32(const String &text) {
+  uint32_t hash = 0x811C9DC5;
+  for (size_t i = 0; i < text.length(); ++i) {
+    hash ^= static_cast<uint8_t>(text[i]);
+    hash *= 0x01000193;
+  }
+  return hash;
+}
+bool parseDecimal(const String &value, uint32_t &result) {
+  if (!value.length()) return false;
+  uint32_t parsed = 0;
+  for (size_t i = 0; i < value.length(); ++i) {
+    if (!isDigit(value[i])) return false;
+    const uint8_t digit = value[i] - '0';
+    if (parsed > (UINT32_MAX - digit) / 10) return false;
+    parsed = parsed * 10 + digit;
+  }
+  result = parsed;
+  return true;
+}
+bool parseFiniteDecimalFloat(const String &value, float &result) {
+  if (!value.length()) return false;
+  bool sawDot = false;
+  for (size_t i = 0; i < value.length(); ++i) {
+    const char c = value[i];
+    if (isDigit(c)) continue;
+    if (c == '.' && !sawDot && i > 0 && i + 1 < value.length()) { sawDot = true; continue; }
+    return false;
+  }
+  char *end = nullptr;
+  const float parsed = strtof(value.c_str(), &end);
+  if (end != value.c_str() + value.length() || !isfinite(parsed)) return false;
+  result = parsed;
+  return true;
+}
+bool parseHex32(const String &value, uint32_t &result) {
+  if (!value.length() || value.length() > 8) return false;
+  uint32_t parsed = 0;
+  for (size_t i = 0; i < value.length(); ++i) {
+    const int nibble = hexNibble(value[i]);
+    if (nibble < 0) return false;
+    parsed = (parsed << 4) | static_cast<uint32_t>(nibble);
+  }
+  result = parsed;
+  return true;
+}
+
 String queueKey(uint8_t i) { return "q" + String(i); }
-uint8_t pendingCount() { return min(queuePrefs.getUChar("count", 0), Config::MAX_PENDING_RECORDS); }
+String queueMetaPayload(uint8_t head, uint8_t count) { return "1:" + String(head) + ":" + String(count); }
+bool storeQueueMeta(uint8_t head, uint8_t count) {
+  if (head >= Config::MAX_PENDING_RECORDS || count > Config::MAX_PENDING_RECORDS) return false;
+  const String payload = queueMetaPayload(head, count);
+  const String encoded = payload + ":" + String(fnv1a32(payload), HEX);
+  return queuePrefs.putString("qmeta", encoded) == encoded.length();
+}
+bool loadQueueMeta(uint8_t &head, uint8_t &count) {
+  const String encoded = queuePrefs.getString("qmeta", "");
+  if (!encoded.length()) {
+    const uint8_t legacyCount = min(queuePrefs.getUChar("qcount", 0), Config::MAX_PENDING_RECORDS);
+    head = 0;
+    count = legacyCount;
+    return storeQueueMeta(head, count);
+  }
+  String fields[4]; uint8_t field = 0;
+  for (size_t i = 0; i <= encoded.length(); ++i) {
+    if (i == encoded.length() || encoded[i] == ':') { if (++field > 4) break; }
+    else if (field < 4) fields[field] += encoded[i];
+  }
+  uint32_t parsedHead = 0, parsedCount = 0, storedChecksum = 0;
+  const bool valid = field == 4 && fields[0] == "1" &&
+    parseDecimal(fields[1], parsedHead) && parseDecimal(fields[2], parsedCount) &&
+    parseHex32(fields[3], storedChecksum) && parsedHead < Config::MAX_PENDING_RECORDS &&
+    parsedCount <= Config::MAX_PENDING_RECORDS &&
+    storedChecksum == fnv1a32("1:" + fields[1] + ":" + fields[2]);
+  if (!valid) { head = count = 0; return false; }
+  head = static_cast<uint8_t>(parsedHead);
+  count = static_cast<uint8_t>(parsedCount);
+  return true;
+}
+uint8_t pendingCount() {
+  uint8_t head = 0, count = 0;
+  return loadQueueMeta(head, count) ? count : 0;
+}
 String encodeRecord(const SessionRecord &r) {
   const char s = 0x1F;
   return r.session_id+s+r.chip_id+s+r.cat_id+s+r.enter_time+s+r.exit_time+s+String(r.duration_sec)+s+
     String(r.min_distance_mm)+s+String(r.avg_distance_mm,1)+s+String(r.sample_count);
 }
 bool decodeRecord(const String &encoded, SessionRecord &r) {
-  String f[9]; uint8_t n=0;
-  for (size_t i=0;i<=encoded.length();++i) {
-    if (i==encoded.length() || encoded[i]==0x1F) { if (++n>9) return false; }
-    else if (n<9) f[n]+=encoded[i];
+  String f[9]; uint8_t n = 0;
+  for (size_t i = 0; i <= encoded.length(); ++i) {
+    if (i == encoded.length() || encoded[i] == 0x1F) { if (++n > 9) return false; }
+    else { if (n >= 9) return false; f[n] += encoded[i]; }
   }
-  if (n!=9) return false;
+  if (n != 9) return false;
+  uint32_t duration = 0, minMm = 0, samples = 0; float avgMm = 0;
+  if (!parseDecimal(f[5], duration) || !parseDecimal(f[6], minMm) ||
+      !parseFiniteDecimalFloat(f[7], avgMm) || !parseDecimal(f[8], samples) ||
+      !f[0].length() || f[0].length() > 80 || f[1].length() > 64 || f[2].length() > 64 ||
+      duration < 1 || duration > 86400 || minMm < 1 || minMm > 2000 ||
+      avgMm < 1 || avgMm > 2000 || samples < 1 || samples > 100000) return false;
   r.session_id=f[0]; r.chip_id=f[1]; r.cat_id=f[2]; r.enter_time=f[3]; r.exit_time=f[4];
-  r.duration_sec=(uint32_t)f[5].toInt(); r.min_distance_mm=(uint16_t)f[6].toInt();
-  r.avg_distance_mm=f[7].toFloat(); r.sample_count=(uint32_t)f[8].toInt();
-  return r.session_id.length() && r.duration_sec>0 && r.sample_count>0;
+  r.duration_sec=duration; r.min_distance_mm=(uint16_t)minMm; r.avg_distance_mm=avgMm; r.sample_count=samples;
+  return true;
 }
 bool enqueueRecord(const SessionRecord &r) {
-  uint8_t count = pendingCount(); if (count >= Config::MAX_PENDING_RECORDS) return false;
-  String e=encodeRecord(r); if (queuePrefs.putString(queueKey(count).c_str(),e)!=e.length()) return false;
-  return queuePrefs.putUChar("count",count+1)==sizeof(uint8_t);
+  uint8_t head = 0, count = 0;
+  if (!loadQueueMeta(head, count) || count >= Config::MAX_PENDING_RECORDS) return false;
+  const uint8_t tail = (head + count) % Config::MAX_PENDING_RECORDS;
+  const String encoded = encodeRecord(r);
+  if (queuePrefs.putString(queueKey(tail).c_str(), encoded) != encoded.length()) return false;
+  // Publish the new record only after its payload is durable.
+  return storeQueueMeta(head, count + 1);
 }
 bool popRecord() {
-  uint8_t count=pendingCount(); if (!count) return true;
-  for (uint8_t i=1;i<count;++i) queuePrefs.putString(queueKey(i-1).c_str(),queuePrefs.getString(queueKey(i).c_str(),""));
-  queuePrefs.remove(queueKey(count-1).c_str());
-  return queuePrefs.putUChar("count",count-1)==sizeof(uint8_t);
+  uint8_t head = 0, count = 0;
+  if (!loadQueueMeta(head, count)) return false;
+  if (!count) return true;
+  // Advance one metadata value; stale payload slots are intentionally left in place.
+  return storeQueueMeta((head + 1) % Config::MAX_PENDING_RECORDS, count - 1);
 }
 
 bool connectSta(uint32_t timeoutMs) {
@@ -336,14 +440,16 @@ bool uploadRecord(const SessionRecord &r) {
 }
 
 void uploadPending() {
-  if (!pendingCount()) return;
+  uint8_t head = 0, count = 0;
+  if (!loadQueueMeta(head, count) || !count) return;
   if (netMode!=NetMode::Sta && !connectSta(Config::WIFI_TIMEOUT_MS)) return;
   syncClock();
-  while (pendingCount()) {
-    SessionRecord r; if (!decodeRecord(queuePrefs.getString("q0",""),r)) break;
+  while (count) {
+    SessionRecord r;
+    if (!decodeRecord(queuePrefs.getString(queueKey(head).c_str(),""),r)) { logLive("queue", "decode/meta failure"); break; }
     if (!uploadRecord(r)) { logLive("upload", "failed"); break; }
     logLive("upload", "ok");
-    if (!popRecord()) break;
+    if (!popRecord() || !loadQueueMeta(head, count)) { logLive("queue", "ack failure"); break; }
   }
 }
 
@@ -363,7 +469,7 @@ void saveTrace(const String &sessionId) {
   String path="/trace"+String(slot)+".csv";
   File f=SPIFFS.open(path,FILE_WRITE); if(!f)return;
   f.println("session_id,"+sessionId); f.println("S,uptime_ms,distance_mm,flags(valid=1 blocked=2 rfid=4)");
-  for(uint16_t i=0;i<traceCount;++i){const TraceSample&s=traceSamples[(traceHead+i)%TRACE_CAP]; f.printf("S,%lu,%u,%u\n",(unsigned long)s.ms,s.mm,s.flags);} 
+  for(uint16_t i=0;i<traceCount;++i){const TraceSample&s=traceSamples[(traceHead+i)%TRACE_CAP]; f.printf("S,%lu,%u,%u\n",(unsigned long)s.ms,s.mm,s.flags);}
   f.println("E,uptime_ms,code,value,aux");
   for(uint8_t i=0;i<traceEventCount;++i){const TraceEvent&e=traceEvents[i];f.printf("E,%lu,%u,%u,%u\n",(unsigned long)e.ms,e.code,e.value,e.aux);} f.close();
   diagPrefs.putUChar("slot",(slot+1)%Config::TRACE_SLOTS);
@@ -398,7 +504,7 @@ String liveLogText() {
 }
 
 String mainHtml() {
-  return String("<!doctype html><html lang='zh-Hant'><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{font-family:system-ui;margin:20px}.box{padding:14px;border:1px solid #bbb;margin:12px 0;max-width:760px}button,input{font-size:16px;padding:10px;margin:6px}</style><h1>Smart Litter Cabinet</h1><div id='s' class='box'>讀取中…</div><p><a href='/diagnostics'>診斷資料</a> · <a href='/live'>即時 Log</a></p><div class='box'><h2>Web OTA</h2><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin,application/octet-stream' required><button>上傳並更新</button></form><p>只選 Arduino 匯出的 <code>*.ino.bin</code>。</p></div><form method='post' action='/normal'><button>關閉維護模式，回低功耗</button></form><script>async function u(){try{let r=await fetch('/api/status',{cache:'no-store'});s.textContent=JSON.stringify(await r.json(),null,2)}catch(e){s.textContent=e}setTimeout(u,1000)}u()</script></html>");
+  return String("<!doctype html><html lang='zh-Hant'><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{font-family:system-ui;margin:20px}.box{padding:14px;border:1px solid #bbb;margin:12px 0;max-width:760px}button,input{font-size:16px;padding:10px;margin:6px}</style><h1>Smart Litter Cabinet</h1><div id='s' class='box'>讀取中…</div><p><a href='/diagnostics'>診斷資料</a> · <a href='/live'>即時 Log</a></p><div class='box'><h2>Web OTA</h2><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin,application/octet-stream' required><button>上傳並更新</button></form><p>只選 Arduino 匯出的 <code>*.ino.bin</code>。事件進行中會拒絕更新。</p></div><form method='post' action='/normal'><button>關閉維護模式，回低功耗</button></form><script>async function u(){try{let r=await fetch('/api/status',{cache:'no-store'});s.textContent=JSON.stringify(await r.json(),null,2)}catch(e){s.textContent=e}setTimeout(u,1000)}u()</script></html>");
 }
 
 void sendFilePath(const String &path,const char *type) {
@@ -415,7 +521,16 @@ void registerWebRoutes() {
   web.on("/diag/previous",HTTP_GET,[](){sendFilePath("/diag.prev.jsonl","application/x-ndjson");});
   web.on("/trace",HTTP_GET,[](){int slot=web.hasArg("slot")?web.arg("slot").toInt():-1;if(slot<0||slot>=Config::TRACE_SLOTS){web.send(400,"text/plain","bad slot");return;}sendFilePath("/trace"+String(slot)+".csv","text/csv");});
   web.on("/normal",HTTP_POST,[](){web.send(200,"text/plain; charset=utf-8","即將回低功耗模式");maintenanceSticky=false;maintenanceDuration=1;maintenanceStarted=0;});
-  web.on("/update",HTTP_POST,[](){bool ok=otaStarted&&!otaFailed&&!Update.hasError();web.sendHeader("Connection","close");web.send(ok?200:500,"text/plain; charset=utf-8",ok?"更新成功，重新啟動":"更新失敗，保留原韌體");if(ok){delay(400);ESP.restart();}otaStarted=otaFailed=false;},[](){HTTPUpload&u=web.upload();if(u.status==UPLOAD_FILE_START){otaStarted=true;otaFailed=false;rfidSet(false);if(!Update.begin(UPDATE_SIZE_UNKNOWN,U_FLASH))otaFailed=true;}else if(u.status==UPLOAD_FILE_WRITE){if(!otaFailed&&Update.write(u.buf,u.currentSize)!=u.currentSize)otaFailed=true;}else if(u.status==UPLOAD_FILE_END){if(!otaFailed&&!Update.end(true))otaFailed=true;}else if(u.status==UPLOAD_FILE_ABORTED){otaFailed=true;Update.abort();}});
+  web.on("/update",HTTP_POST,[](){bool ok=otaStarted&&!otaFailed&&!Update.hasError();web.sendHeader("Connection","close");web.send(ok?200:500,"text/plain; charset=utf-8",ok?"更新成功，重新啟動":"更新失敗或事件進行中，保留原韌體");if(ok){delay(400);ESP.restart();}otaStarted=otaFailed=false;},[](){
+    HTTPUpload&u=web.upload();
+    if(u.status==UPLOAD_FILE_START){
+      otaStarted=true; otaFailed=false;
+      if(metrics.open || visit.phase==Visit::Phase::Candidate || visit.phase==Visit::Phase::Entry || visit.phase==Visit::Phase::Exit){otaFailed=true;return;}
+      rfidSet(false); if(!Update.begin(UPDATE_SIZE_UNKNOWN,U_FLASH))otaFailed=true;
+    }else if(u.status==UPLOAD_FILE_WRITE){if(!otaFailed&&Update.write(u.buf,u.currentSize)!=u.currentSize)otaFailed=true;}
+    else if(u.status==UPLOAD_FILE_END){if(!otaFailed&&!Update.end(true))otaFailed=true;}
+    else if(u.status==UPLOAD_FILE_ABORTED){otaFailed=true;Update.abort();}
+  });
   web.onNotFound([](){web.send(404,"text/plain","not found");});
 }
 
@@ -479,6 +594,7 @@ void processSensor() {
   visit.sample(now,mm!=UINT16_MAX,mm);
   if(before==Visit::Phase::Idle && visit.phase==Visit::Phase::Candidate) metricsBegin(now,mm);
   else if(metrics.open) metricsSample(now,mm);
+  if(mm==UINT16_MAX) handleInvalidDistance(now); else invalidDistanceSinceMs=0;
   syncRfidPower();
   if(visit.phase==Visit::Phase::Complete)finishSession();
 }
@@ -497,8 +613,9 @@ void setup() {
   pinMode(Config::RFID_ENABLE_PIN,OUTPUT);digitalWrite(Config::RFID_ENABLE_PIN,LOW);
   pinMode(Config::TOF_INT_PIN,INPUT_PULLUP);
   rfidSerial.setRxBufferSize(512);rfidSerial.begin(9600,SERIAL_8N1,Config::RFID_RX_PIN,-1);
-  queuePrefs.begin("litter-v2",false);diagPrefs.begin("litter-diag",false);
-  spiffsReady=SPIFFS.begin(false);
+  queuePrefs.begin("litter",false);diagPrefs.begin("litter-diag",false);
+  // Diagnostics are expendable; format only if the diagnostics filesystem cannot mount.
+  spiffsReady=SPIFFS.begin(true);
   initTof();
   startMaintenance(Config::BOOT_MAINTENANCE_MS);
   if(netMode==NetMode::Sta)uploadPending();
