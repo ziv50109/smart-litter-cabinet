@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Update.h>
 #include <VL53L0X.h>
 #include <esp_sleep.h>
 #include <esp_timer.h>
@@ -87,6 +88,8 @@ bool gotByte = false;
 bool tofReady = false;
 bool portalStarted = false;
 bool havePreviousSample = false;
+bool otaStarted = false;
+bool otaFailed = false;
 uint32_t lastSample = 0;
 uint32_t poweredAt = 0;
 uint32_t seenGeneration = 0;
@@ -196,9 +199,9 @@ const char *catLabel(uint16_t cat) {
 String summaryHtml() {
   const uint16_t cat = lastRecognizedCat();
   String html;
-  html.reserve(5000);
+  html.reserve(6500);
   html += F("<!doctype html><html lang='zh-Hant'><meta name='viewport' content='width=device-width,initial-scale=1'>");
-  html += F("<style>body{font-family:system-ui;margin:20px;line-height:1.55}table{border-collapse:collapse;width:100%;max-width:760px}td,th{border:1px solid #bbb;padding:7px;text-align:left}button,a{font-size:16px;padding:10px 14px;margin:8px 4px 8px 0}</style>");
+  html += F("<style>body{font-family:system-ui;margin:20px;line-height:1.55}table{border-collapse:collapse;width:100%;max-width:760px}td,th{border:1px solid #bbb;padding:7px;text-align:left}button,input,a{font-size:16px;padding:10px 14px;margin:8px 4px 8px 0}.box{border:1px solid #bbb;padding:14px;max-width:760px;margin-top:18px}</style>");
   html += F("<h1>LitterProbe 測試結果</h1>");
   html += F("<p><b>測試期間 Wi-Fi 是關閉的。</b>現在這個 Wi-Fi 是測試結束後才開啟，所以不會污染本次待機/RFID 測量。</p>");
   html += F("<table><tr><th>項目</th><th>結果</th></tr>");
@@ -216,6 +219,8 @@ String summaryHtml() {
   html += F("<p><a href='/raw'>查看完整原始紀錄</a></p>");
   html += F("<form method='post' action='/rerun'><button type='submit'>重新測一次</button></form>");
   html += F("<p>重新測試後 Wi-Fi 會立刻消失；最長等待 15 分鐘。第一次 &lt;200mm 後再記錄 60 秒，結束後 LitterProbe Wi-Fi 會重新出現。</p>");
+  html += F("<div class='box'><h2>無線更新韌體</h2><p>只選 Arduino 匯出的 <code>*.ino.bin</code> application image。更新成功後裝置會自動重新啟動。</p>");
+  html += F("<form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin,application/octet-stream' required><button type='submit'>上傳並更新</button></form></div>");
   html += F("</html>");
   return html;
 }
@@ -264,6 +269,35 @@ void startResultPortal() {
     delay(100);
     ESP.restart();
   });
+  web.on("/update", HTTP_POST,
+    []() {
+      const bool ok = otaStarted && !otaFailed && !Update.hasError();
+      web.sendHeader("Connection", "close");
+      web.send(ok ? 200 : 500, "text/plain; charset=utf-8",
+        ok ? "更新成功，裝置即將重新啟動。" : "更新失敗，原韌體保持可開機；請返回重試。");
+      if (ok) {
+        delay(400);
+        ESP.restart();
+      }
+      otaStarted = false;
+      otaFailed = false;
+    },
+    []() {
+      HTTPUpload &upload = web.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        otaStarted = true;
+        otaFailed = false;
+        setReaderPower(false);
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) otaFailed = true;
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (!otaFailed && Update.write(upload.buf, upload.currentSize) != upload.currentSize) otaFailed = true;
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (!otaFailed && !Update.end(true)) otaFailed = true;
+      } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        otaFailed = true;
+        Update.abort();
+      }
+    });
   web.onNotFound([]() { web.send(404, "text/plain; charset=utf-8", "Not found"); });
   web.begin();
   portalStarted = true;
@@ -292,6 +326,8 @@ void startRun() {
   tofReady = false;
   portalStarted = false;
   havePreviousSample = false;
+  otaStarted = false;
+  otaFailed = false;
   lastSample = 0;
   poweredAt = 0;
   seenGeneration = 0;
