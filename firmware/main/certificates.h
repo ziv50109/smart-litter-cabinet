@@ -2,9 +2,6 @@
 
 #include <Arduino.h>
 
-// Google may serve either RSA (R1) or ECDSA (R4) certificate chains.
-// Keep both public trust anchors in one PEM bundle so HTTPS uploads continue
-// working when Google rotates the chain used by script.google.com.
 static const char GOOGLE_ROOT_CA_BUNDLE[] PROGMEM = R"CERT(
 -----BEGIN CERTIFICATE-----
 MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw
