@@ -13,6 +13,14 @@
 - `no_exit_timeout` / `exit_unconfirmed_timeout` 只保存診斷，不上傳 Sheets，避免把固定 300 秒冒充真實停留時間。
 - 正常事件維持原 Sheets 九欄格式。
 
+## Merge 前健壯性
+
+- VL53L0X 連續 5 秒無效時自動重新初始化；失敗後以 5 秒 backoff 重試，不需人工重開機。
+- clear / exit 判定只接受連續觀測；樣本間隔超過 1 秒或遇到 invalid sample 時，未觀測的時間不算 clear 證據。
+- NVS 待傳紀錄沿用 `litter` namespace 與單一 checksum metadata 的 ring queue。先寫 payload、再發布 count；成功上傳後只原子推進 head/count，不搬移整個 queue，降低突然斷電造成遺失或重排的風險。
+- diagnostics SPIFFS 以 `formatOnFail` 掛載；首次未格式化或診斷 filesystem 無法掛載時只重建 diagnostics partition，不影響 OTA app slot 或 NVS pending queue。
+- OTA 在活動中的貓咪事件期間會拒絕更新，避免更新流程中斷 RFID / distance event。
+
 ## 長期診斷資料
 
 不需要常駐 Web Debug 才能蒐集資料：
@@ -49,6 +57,14 @@ firmware/main/main.ino
 
 板子選 `XIAO ESP32S3`，使用目前 8MB、含 `otadata` / `ota_0` / `ota_1` / SPIFFS 的 partition scheme。先 Verify；通過後 Export Compiled Binary。
 
+純 state machine host regression：
+
+```powershell
+python firmware/tests/main_host/run.py
+```
+
+涵蓋短訪問、exit scan timeout、不持續遮擋誤判、長 sample gap 與 invalid sample 不得被當成連續 clear。
+
 ## 若目前裝置已有 Web OTA
 
 如果現在運行中的維護頁已看得到「無線更新韌體 / Web OTA」，手機或電腦可以直接選新的：
@@ -57,7 +73,7 @@ firmware/main/main.ino
 main.ino.bin
 ```
 
-上傳更新，不需要 USB。
+上傳更新，不需要 USB。事件正在進行時 OTA 會被拒絕，等事件結束後的維護窗口再更新即可。
 
 如果目前頁面沒有 OTA 區塊，才需要最後一次手機 USB/OTG。
 
@@ -90,10 +106,10 @@ nrflash write --chip esp32s3 --offset 0x10000 /storage/emulated/0/Download/ESP32
 
 ## 實機驗收
 
-這版尚需在實際 XIAO ESP32-S3 Arduino toolchain Verify。上板後先確認：
+目前 probe 已實測空櫃 RFID 不開啟、Light-sleep 正常；真貓通過曾得到兩次按需 RFID 掃描且兩次辨識成功。正式 `main` 仍應持續觀察：
 
 1. 待機時 `rfid_on=false`。
-2. 貓通過時 RFID 才 ON，且能穩定辨識兩隻貓。
+2. 貓通過時 RFID 才 ON，且兩隻貓均能穩定辨識。
 3. Sheets duration 與實際短訪問接近，不再出現假的 241/300 秒。
 4. `/diagnostics` 可下載事件摘要與 raw trace。
 5. Web OTA 能在兩個 OTA slot 間更新並正常重啟。
