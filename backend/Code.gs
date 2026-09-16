@@ -23,6 +23,9 @@ const SHEET_HEADERS = [
 ];
 
 const MAX_BODY_BYTES = 4096;
+const SHEET_TIME_ZONE = 'Asia/Taipei';
+const SHEET_DATETIME_FORMAT = 'yyyy/MM/dd HH:mm:ss';
+const DATETIME_MIGRATION_PREFIX = 'SHEET_DATETIME_V1_';
 const ALLOWED_TOP_LEVEL_KEYS = new Set(['device_token', 'session']);
 const ALLOWED_SESSION_KEYS = new Set(FIELD_KEYS);
 
@@ -32,7 +35,7 @@ function jsonResponse_(payload) {
 }
 
 function safeCell_(value) {
-  if (typeof value === 'number') return value;
+  if (typeof value === 'number' || value instanceof Date) return value;
   const text = String(value == null ? '' : value);
   return /^[=+\-@]/.test(text) ? "'" + text : text;
 }
@@ -102,22 +105,67 @@ function validate_(session) {
   };
 }
 
+function isStoredIsoTime_(value) {
+  return typeof value === 'string' &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value) &&
+    Number.isFinite(Date.parse(value));
+}
+
+function migrateDateTimeColumns_(sheet, spreadsheetId) {
+  const props = PropertiesService.getScriptProperties();
+  const migrationKey = DATETIME_MIGRATION_PREFIX + spreadsheetId;
+  if (props.getProperty(migrationKey) === 'done') return;
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    const range = sheet.getRange(2, 4, lastRow - 1, 2);
+    const values = range.getValues();
+    let changed = false;
+
+    values.forEach(row => {
+      for (let index = 0; index < row.length; index++) {
+        if (isStoredIsoTime_(row[index])) {
+          row[index] = new Date(row[index]);
+          changed = true;
+        }
+      }
+    });
+
+    if (changed) range.setValues(values);
+    range.setNumberFormat(SHEET_DATETIME_FORMAT);
+  }
+
+  props.setProperty(migrationKey, 'done');
+}
+
+function sheetValue_(key, value) {
+  if ((key === 'enter_time' || key === 'exit_time') && value !== '') {
+    return new Date(value);
+  }
+  return safeCell_(value);
+}
+
 function ensureSheet_(spreadsheetId) {
-  const sheet = SpreadsheetApp.openById(spreadsheetId).getSheets()[0];
+  const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+  if (spreadsheet.getSpreadsheetTimeZone() !== SHEET_TIME_ZONE) {
+    spreadsheet.setSpreadsheetTimeZone(SHEET_TIME_ZONE);
+  }
+
+  const sheet = spreadsheet.getSheets()[0];
   if (sheet.getLastRow() === 0) {
     sheet.appendRow(SHEET_HEADERS);
-    return sheet;
+  } else {
+    const actualHeaders = sheet.getRange(1, 1, 1, SHEET_HEADERS.length).getValues()[0];
+    const isLegacySchema = actualHeaders.every((value, index) => value === FIELD_KEYS[index]);
+    if (isLegacySchema && sheet.getLastColumn() === FIELD_KEYS.length) {
+      sheet.getRange(1, 1, 1, SHEET_HEADERS.length).setValues([SHEET_HEADERS]);
+    } else if (sheet.getLastColumn() !== SHEET_HEADERS.length ||
+        actualHeaders.some((value, index) => value !== SHEET_HEADERS[index])) {
+      throw new Error('invalid_sheet_schema');
+    }
   }
-  const actualHeaders = sheet.getRange(1, 1, 1, SHEET_HEADERS.length).getValues()[0];
-  const isLegacySchema = actualHeaders.every((value, index) => value === FIELD_KEYS[index]);
-  if (isLegacySchema && sheet.getLastColumn() === FIELD_KEYS.length) {
-    sheet.getRange(1, 1, 1, SHEET_HEADERS.length).setValues([SHEET_HEADERS]);
-    return sheet;
-  }
-  if (sheet.getLastColumn() !== SHEET_HEADERS.length ||
-      actualHeaders.some((value, index) => value !== SHEET_HEADERS[index])) {
-    throw new Error('invalid_sheet_schema');
-  }
+
+  migrateDateTimeColumns_(sheet, spreadsheetId);
   return sheet;
 }
 
@@ -165,7 +213,9 @@ function doPost(e) {
           return jsonResponse_({ok: true, duplicate: true});
         }
       }
-      sheet.appendRow(FIELD_KEYS.map(key => safeCell_(row[key])));
+
+      sheet.appendRow(FIELD_KEYS.map(key => sheetValue_(key, row[key])));
+      sheet.getRange(sheet.getLastRow(), 4, 1, 2).setNumberFormat(SHEET_DATETIME_FORMAT);
     } finally {
       lock.releaseLock();
     }
