@@ -42,7 +42,7 @@ int main() {
     sample(e, 2300, 240);
     sample(e, 2400, 100);
     assert(e.phase == Phase::Exit);
-    sample(e, 2500, 240);
+    for (uint32_t t = 2500; t <= 11500; t += 1000) sample(e, t, 240);
     e.tick(12401);
     assert(!e.scanning);
     sample(e, 12500, 240);
