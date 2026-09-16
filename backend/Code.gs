@@ -16,6 +16,18 @@ const SHEET_HEADERS = [
   '貓咪',
   '進入時間',
   '離開時間',
+  '停留時間',
+  '最短距離（mm）',
+  '平均距離（mm）',
+  '取樣次數',
+];
+
+const PREVIOUS_SHEET_HEADERS = [
+  '紀錄編號',
+  '晶片編號',
+  '貓咪',
+  '進入時間',
+  '離開時間',
   '停留秒數',
   '最短距離（mm）',
   '平均距離（mm）',
@@ -25,7 +37,8 @@ const SHEET_HEADERS = [
 const MAX_BODY_BYTES = 4096;
 const SHEET_TIME_ZONE = 'Asia/Taipei';
 const SHEET_DATETIME_FORMAT = 'yyyy/MM/dd HH:mm:ss';
-const DATETIME_MIGRATION_PREFIX = 'SHEET_DATETIME_V1_';
+const SHEET_DURATION_FORMAT = '[m]:ss';
+const SHEET_MIGRATION_PREFIX = 'SHEET_FORMAT_V2_';
 const ALLOWED_TOP_LEVEL_KEYS = new Set(['device_token', 'session']);
 const ALLOWED_SESSION_KEYS = new Set(FIELD_KEYS);
 
@@ -111,28 +124,43 @@ function isStoredIsoTime_(value) {
     Number.isFinite(Date.parse(value));
 }
 
-function migrateDateTimeColumns_(sheet, spreadsheetId) {
+function migrateSheetValues_(sheet, spreadsheetId) {
   const props = PropertiesService.getScriptProperties();
-  const migrationKey = DATETIME_MIGRATION_PREFIX + spreadsheetId;
+  const migrationKey = SHEET_MIGRATION_PREFIX + spreadsheetId;
   if (props.getProperty(migrationKey) === 'done') return;
 
   const lastRow = sheet.getLastRow();
   if (lastRow > 1) {
-    const range = sheet.getRange(2, 4, lastRow - 1, 2);
-    const values = range.getValues();
-    let changed = false;
+    const timeRange = sheet.getRange(2, 4, lastRow - 1, 2);
+    const timeValues = timeRange.getValues();
+    let timeChanged = false;
 
-    values.forEach(row => {
+    timeValues.forEach(row => {
       for (let index = 0; index < row.length; index++) {
         if (isStoredIsoTime_(row[index])) {
           row[index] = new Date(row[index]);
-          changed = true;
+          timeChanged = true;
         }
       }
     });
 
-    if (changed) range.setValues(values);
-    range.setNumberFormat(SHEET_DATETIME_FORMAT);
+    if (timeChanged) timeRange.setValues(timeValues);
+    timeRange.setNumberFormat(SHEET_DATETIME_FORMAT);
+
+    const durationRange = sheet.getRange(2, 6, lastRow - 1, 1);
+    const durationValues = durationRange.getValues();
+    let durationChanged = false;
+
+    durationValues.forEach(row => {
+      const value = row[0];
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 1) {
+        row[0] = value / 86400;
+        durationChanged = true;
+      }
+    });
+
+    if (durationChanged) durationRange.setValues(durationValues);
+    durationRange.setNumberFormat(SHEET_DURATION_FORMAT);
   }
 
   props.setProperty(migrationKey, 'done');
@@ -142,6 +170,7 @@ function sheetValue_(key, value) {
   if ((key === 'enter_time' || key === 'exit_time') && value !== '') {
     return new Date(value);
   }
+  if (key === 'duration_sec') return value / 86400;
   return safeCell_(value);
 }
 
@@ -157,7 +186,8 @@ function ensureSheet_(spreadsheetId) {
   } else {
     const actualHeaders = sheet.getRange(1, 1, 1, SHEET_HEADERS.length).getValues()[0];
     const isLegacySchema = actualHeaders.every((value, index) => value === FIELD_KEYS[index]);
-    if (isLegacySchema && sheet.getLastColumn() === FIELD_KEYS.length) {
+    const isPreviousSchema = actualHeaders.every((value, index) => value === PREVIOUS_SHEET_HEADERS[index]);
+    if ((isLegacySchema || isPreviousSchema) && sheet.getLastColumn() === FIELD_KEYS.length) {
       sheet.getRange(1, 1, 1, SHEET_HEADERS.length).setValues([SHEET_HEADERS]);
     } else if (sheet.getLastColumn() !== SHEET_HEADERS.length ||
         actualHeaders.some((value, index) => value !== SHEET_HEADERS[index])) {
@@ -165,7 +195,7 @@ function ensureSheet_(spreadsheetId) {
     }
   }
 
-  migrateDateTimeColumns_(sheet, spreadsheetId);
+  migrateSheetValues_(sheet, spreadsheetId);
   return sheet;
 }
 
@@ -215,7 +245,9 @@ function doPost(e) {
       }
 
       sheet.appendRow(FIELD_KEYS.map(key => sheetValue_(key, row[key])));
-      sheet.getRange(sheet.getLastRow(), 4, 1, 2).setNumberFormat(SHEET_DATETIME_FORMAT);
+      const insertedRow = sheet.getLastRow();
+      sheet.getRange(insertedRow, 4, 1, 2).setNumberFormat(SHEET_DATETIME_FORMAT);
+      sheet.getRange(insertedRow, 6).setNumberFormat(SHEET_DURATION_FORMAT);
     } finally {
       lock.releaseLock();
     }
