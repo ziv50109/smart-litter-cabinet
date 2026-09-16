@@ -74,14 +74,18 @@ struct Engine {
     }
 
     const bool blocked = valid && mm < Config::ENTRY_THRESHOLD_MM;
+    const uint32_t sampleGap = sampled ? uint32_t(now - lastSample) : 0;
+    const bool continuous = sampled && sampleGap <= Config::SAMPLE_GAP_MS;
     bool blockedEdge = false;
     uint32_t clearBeforeBlock = 0;
+
     if (valid) {
       if (blocked) {
-        blockedEdge = previousValid && !previousBlocked;
+        blockedEdge = continuous && previousValid && !previousBlocked;
         if (blockedEdge && clearSince) clearBeforeBlock = uint32_t(now - clearSince);
         clearSince = 0;
-      } else if (!previousValid || previousBlocked || !clearSince) {
+      } else if (!continuous || !previousValid || previousBlocked || !clearSince) {
+        // Never count an unsampled interval as evidence that the doorway stayed clear.
         clearSince = now;
       }
     } else {
