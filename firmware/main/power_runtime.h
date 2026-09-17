@@ -11,8 +11,13 @@ void configurePower() {
     if (rfidClockLock) { esp_pm_lock_delete(rfidClockLock); rfidClockLock = nullptr; }
     powerReason = "pm_lock_init_failed"; return;
   }
+  // Use the SDK's configured ceiling, not the frequency at a transient DFS state.
+  // This also avoids depending on Arduino's CPU HAL linkage in the IDF component build.
+  static_assert(CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ >= 80, "PM requires an S3 CPU ceiling of at least 80 MHz");
   esp_pm_config_t pm = {};
-  pm.max_freq_mhz = getCpuFrequencyMhz(); pm.min_freq_mhz = 80; pm.light_sleep_enable = true;
+  pm.max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+  pm.min_freq_mhz = 80;
+  pm.light_sleep_enable = true;
   const esp_err_t result = esp_pm_configure(&pm);
   if (result != ESP_OK) {
     esp_pm_lock_delete(rfidSleepLock); esp_pm_lock_delete(rfidClockLock);
