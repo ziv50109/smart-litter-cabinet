@@ -198,7 +198,7 @@ function isoSeconds_(date) {
 
 // Manual Apps Script smoke test. Running this function writes one TEST row
 // to the configured spreadsheet using the same doPost() path as the device.
-function testWriteSample_() {
+function doTest() {
   const props = PropertiesService.getScriptProperties();
   const deviceToken = props.getProperty('DEVICE_TOKEN');
   if (!deviceToken) throw new Error('DEVICE_TOKEN is not configured');
