@@ -16,6 +16,16 @@ int main() {
   assert(safeSessionId("0E534398-03625FF7-8FEE68"));
   for (const char *bad : {"", "../secrets", "x.csv", "a\r\nHeader", "<script>", "a\"", "a/b"}) assert(!safeSessionId(bad));
 
+  assert(queuedTimestampState("2026-09-17T13:00:00Z", "boot-a", false) == QueuedTimestampState::Ready);
+  assert(queuedTimestampState("@boot-a:12345", "boot-a", false) == QueuedTimestampState::WaitForClock);
+  assert(queuedTimestampState("@boot-a:12345", "boot-a", true) == QueuedTimestampState::Ready);
+  for (const char *bad : {"", "@", "@boot-a:", "@boot-a:12x", "@boot-b:12345"}) {
+    assert(queuedTimestampState(bad, "boot-a", true) == QueuedTimestampState::Unrecoverable);
+  }
+  assert(!queueHeadUnrecoverable("@boot-a:100", "@boot-a:200", "boot-a", false));
+  assert(queueHeadUnrecoverable("@boot-old:100", "@boot-old:200", "boot-a", true));
+  assert(queueHeadUnrecoverable("", "2026-09-17T13:00:00Z", "boot-a", true));
+
   Window w;
   assert(!w.active(0));
   w.open(UINT32_MAX - 10, 20);
