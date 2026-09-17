@@ -355,6 +355,47 @@ void saveDiagnostics(const DiagnosticSnapshot &d) {
   j += ",\"entry_scan\":" + scanJson(m.entryScan) + ",\"exit_scan\":" + scanJson(m.exitScan) + "}";
   appendDiag(j);
 }
+
+bool quarantineUnrecoverableQueueHead() {
+  uint8_t head = 0, count = 0;
+  String encoded;
+  SessionRecord record;
+  bool decoded = false;
+  {
+    ScopedLock guard(queueMutex);
+    if (!loadQueueMeta(head, count) || !count) return false;
+    encoded = queuePrefs.getString(queueKey(head).c_str(), "");
+    decoded = decodeRecord(encoded, record);
+  }
+  const bool unrecoverable = !decoded ||
+    Runtime::queueHeadUnrecoverable(record.enter_time.c_str(), record.exit_time.c_str(), bootId.c_str(), timeValid());
+  if (!unrecoverable) return false;
+
+  const String reason = decoded ? "timestamp_unrecoverable" : "decode_failure";
+  const String sid = decoded ? record.session_id : String("");
+  {
+    ScopedLock guard(diagMutex);
+    String diagnostic = "{\"schema\":2,\"event\":\"queue_quarantine\",\"session_id\":\"" +
+      jsonEscape(sid) + "\",\"reason\":\"" + reason + "\",\"record_hash\":\"" +
+      String(fnv1a32(encoded), HEX) + "\"}";
+    appendDiag(diagnostic);
+  }
+  logLive("queue_quarantine", reason + (sid.length() ? " " + sid : ""));
+
+  ScopedLock guard(queueMutex);
+  uint8_t currentHead = 0, currentCount = 0;
+  if (!loadQueueMeta(currentHead, currentCount) || !currentCount || currentHead != head ||
+      queuePrefs.getString(queueKey(currentHead).c_str(), "") != encoded) {
+    logLive("queue_quarantine", "head changed; retry");
+    return false;
+  }
+  if (!popRecord()) {
+    logLive("queue_quarantine", "advance failed");
+    return false;
+  }
+  return true;
+}
+
 void stopNetwork() {
   if (webRunning) { web.stop(); webRunning = false; }
   cleanupOta(); csrfToken = ""; nonceIssued = false;
@@ -397,7 +438,8 @@ void networkTask(void *) {
       if (!otaRequestOpen && netMode.load() == NetMode::Sta &&
           (uploadRequested || uint32_t(millis() - lastUpload) >= Config::UPLOAD_RETRY_MS)) {
         uploadRequested = false; lastUpload = millis();
-        uploadPending(); // One record; service the management listener between uploads.
+        for (uint8_t skipped = 0; skipped < Config::MAX_PENDING_RECORDS && quarantineUnrecoverableQueueHead(); ++skipped) {}
+        uploadPending(); // One recoverable record; service the management listener between uploads.
       }
     }
     delay(Config::NETWORK_POLL_MS);
