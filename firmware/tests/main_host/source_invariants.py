@@ -19,6 +19,9 @@ assert "Update.end(true)" not in main + web
 assert "if (otaRequestOpen) { failOta(400); return; }" in web
 assert '"Content-Disposition"' in web and '"diagnostics-current.jsonl"' in web
 assert "expectedId != id" in web
+assert "quarantineUnrecoverableQueueHead" in web
+assert '"queue_quarantine"' in web
+assert web.index("quarantineUnrecoverableQueueHead();") < web.index("uploadPending();", web.index("void networkTask"))
 assert "CONFIG_PM_ENABLE && CONFIG_FREERTOS_USE_TICKLESS_IDLE" in power
 assert "if (automaticPm.load()" in power
 assert "sdk_pm_or_tickless_unavailable" in power
