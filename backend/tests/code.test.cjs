@@ -247,7 +247,7 @@ test('formula-like text is escaped while numeric source semantics remain valid',
 
 test('manual smoke test writes one TEST row through doPost', () => {
   const h = createHarness();
-  h.context.testWriteSample_();
+  h.context.doTest();
 
   assert.equal(h.rows.length, 2);
   assert.equal(h.rows[1][0], 'test-00000000-0000-4000-8000-000000000000');
