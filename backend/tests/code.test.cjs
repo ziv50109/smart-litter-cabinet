@@ -7,6 +7,7 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 
 const source = readFileSync(join(__dirname, '..', 'Code.gs'), 'utf8');
+const DAY = 86400;
 const FIELDS = [
   'session_id', 'chip_id', 'cat_id', 'enter_time', 'exit_time',
   'duration_sec', 'min_distance_mm', 'avg_distance_mm', 'sample_count'
@@ -41,6 +42,7 @@ function createHarness(initialRows = []) {
   let locked = false;
   let timeZoneWriteCount = 0;
   let numberFormatWriteCount = 0;
+  const logs = [];
 
   const sheet = {
     getLastRow: () => rows.length,
@@ -96,11 +98,15 @@ function createHarness(initialRows = []) {
     Set,
     JSON,
     Math,
-    console: { error() {} },
+    console: { error() {}, log(value) { logs.push(value); } },
     ContentService: {
       MimeType: { JSON: 'application/json' },
       createTextOutput(text) {
-        return { text, setMimeType() { return this; } };
+        return {
+          text,
+          setMimeType() { return this; },
+          getContent() { return text; },
+        };
       },
     },
     PropertiesService: {
@@ -110,6 +116,7 @@ function createHarness(initialRows = []) {
     },
     Utilities: {
       newBlob: text => ({ getBytes: () => Buffer.from(text, 'utf8') }),
+      getUuid: () => '00000000-0000-4000-8000-000000000000',
     },
     SpreadsheetApp: {
       openById(id) {
@@ -133,6 +140,8 @@ function createHarness(initialRows = []) {
 
   return {
     rows,
+    logs,
+    context,
     get timeZoneWriteCount() { return timeZoneWriteCount; },
     get numberFormatWriteCount() { return numberFormatWriteCount; },
     post(session = fixture()) {
@@ -145,22 +154,22 @@ function createHarness(initialRows = []) {
   };
 }
 
-test('stores accepted source values without presentation conversion', () => {
+test('stores timestamps and duration as Sheet-native values without presentation writes', () => {
   const h = createHarness();
   const session = fixture();
 
   assert.deepEqual(h.post(session), { ok: true });
   assert.deepEqual(h.rows[0], HEADERS);
-  assert.equal(h.rows[1][3], session.enter_time);
-  assert.equal(h.rows[1][4], session.exit_time);
-  assert.equal(h.rows[1][5], 241);
-  assert.equal(typeof h.rows[1][3], 'string');
-  assert.equal(typeof h.rows[1][5], 'number');
+  assert.ok(h.rows[1][3] instanceof Date);
+  assert.ok(h.rows[1][4] instanceof Date);
+  assert.equal(h.rows[1][3].toISOString(), '2026-09-16T14:37:57.000Z');
+  assert.equal(h.rows[1][4].toISOString(), '2026-09-16T14:41:58.000Z');
+  assert.equal(h.rows[1][5], 241 / DAY);
   assert.equal(h.timeZoneWriteCount, 0);
   assert.equal(h.numberFormatWriteCount, 0);
 });
 
-test('blank timestamps remain blank strings and duration remains seconds', () => {
+test('blank timestamps stay blank and zero-second duration stays zero', () => {
   const h = createHarness();
   assert.deepEqual(h.post(fixture({ enter_time: '', exit_time: '', duration_sec: 0 })), { ok: true });
   assert.equal(h.rows[1][3], '');
@@ -176,8 +185,6 @@ test('renames previous Chinese header only and leaves existing data untouched', 
   assert.deepEqual(h.post(fixture({ session_id: 'session-new' })), { ok: true });
   assert.deepEqual(h.rows[0], HEADERS);
   assert.deepEqual(h.rows[1], existing);
-  assert.equal(h.rows[1][5], 241);
-  assert.equal(typeof h.rows[1][3], 'string');
 });
 
 test('renames legacy English header only and leaves existing data untouched', () => {
@@ -191,7 +198,17 @@ test('renames legacy English header only and leaves existing data untouched', ()
 });
 
 test('duplicate session is idempotent and does not rewrite data', () => {
-  const existing = FIELDS.map(key => fixture()[key]);
+  const existing = [
+    fixture().session_id,
+    fixture().chip_id,
+    fixture().cat_id,
+    new Date(fixture().enter_time),
+    new Date(fixture().exit_time),
+    fixture().duration_sec / DAY,
+    fixture().min_distance_mm,
+    fixture().avg_distance_mm,
+    fixture().sample_count,
+  ];
   const h = createHarness([HEADERS, existing]);
   const snapshot = h.rows.map(row => [...row]);
 
@@ -220,10 +237,24 @@ test('timestamp validation keeps API contract and rejects inconsistent duration'
   });
 });
 
-test('formula-like text is escaped while numeric source values remain numeric', () => {
+test('formula-like text is escaped while numeric source semantics remain valid', () => {
   const h = createHarness();
   const session = fixture({ cat_id: '=IMPORTXML("x","y")' });
   assert.deepEqual(h.post(session), { ok: true });
   assert.equal(h.rows[1][2], "'=IMPORTXML(\"x\",\"y\")");
-  assert.equal(h.rows[1][5], 241);
+  assert.equal(h.rows[1][5], 241 / DAY);
+});
+
+test('manual smoke test writes one TEST row through doPost', () => {
+  const h = createHarness();
+  h.context.testWriteSample_();
+
+  assert.equal(h.rows.length, 2);
+  assert.equal(h.rows[1][0], 'test-00000000-0000-4000-8000-000000000000');
+  assert.equal(h.rows[1][1], 'ABC123');
+  assert.equal(h.rows[1][2], 'TEST');
+  assert.ok(h.rows[1][3] instanceof Date);
+  assert.ok(h.rows[1][4] instanceof Date);
+  assert.equal(h.rows[1][5], 81 / DAY);
+  assert.equal(h.logs.at(-1), '{"ok":true}');
 });
