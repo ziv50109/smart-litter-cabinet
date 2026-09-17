@@ -1,14 +1,17 @@
-
 # VL53L0X distance web test
 
-This hardware-validation sketch was saved from the original Arduino IDE `sketch_aug22b`. On the XIAO ESP32-S3, VL53L0X uses GPIO5/SDA and GPIO6/SCL. The sensor runs a 100 ms continuous-ranging cycle, while the phone webpage refreshes every 500 ms.
+Standalone XIAO ESP32-S3 hardware test for viewing VL53L0X distance readings from a phone. Wiring follows the project hardware documentation.
 
-Before use, copy `secrets.example.h` to `secrets.h` and set the local Wi-Fi credentials. The displayed distance categories are calibration aids, not the main system's entry/exit thresholds.
+Copy `secrets.example.h` to local `secrets.h`, set Wi-Fi credentials, build `vl53l0x_distance_web.ino`, and open the IP printed by Serial Monitor.
+
+Sampling, webpage refresh, and display-classification values belong to this test sketch and are not duplicated here. The webpage's distance labels are calibration aids only; production doorway detection uses `Config::ENTRY_THRESHOLD_MM` from `firmware/main/app_config.h`.
 
 ---
 
 # VL53L0X 網頁測距測試
 
-從 Arduino IDE 原始 `sketch_aug22b` 另存的硬體驗證程式。XIAO ESP32-S3 使用 GPIO5/SDA、GPIO6/SCL 連接 VL53L0X，感測器連續測距週期為 100 ms，手機網頁每 500 ms 更新。
+以 XIAO ESP32-S3 獨立測試 VL53L0X，並從手機網頁查看即時距離；接線以專案硬體文件為準。
 
-開啟前複製 `secrets.example.h` 為 `secrets.h` 並填入本機 Wi-Fi。本測試的顯示分類門檻只是調校輔助，不是主系統的進出判斷參數。
+複製 `secrets.example.h` 為本機 `secrets.h` 並填入 Wi-Fi，編譯 `vl53l0x_distance_web.ino` 後，使用 Serial Monitor 顯示的 IP 開啟頁面。
+
+測距週期、網頁更新頻率與畫面上的距離分類都屬於這支測試程式，不在 README 重複數值。網頁分類只用於調校；正式韌體的入口門檻以 `firmware/main/app_config.h` 的 `Config::ENTRY_THRESHOLD_MM` 為準。
