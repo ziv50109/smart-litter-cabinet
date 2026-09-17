@@ -1,6 +1,6 @@
 # Battery / RFID probe
 
-`battery_probe` 是離線硬體診斷工具，用來比較 RFID 按需供電、Light-sleep 與 RFID 常開參考模式。它不建立正式如廁紀錄、不連 Wi-Fi、不寫 Google Sheets，也不把測試記錄中的 uptime 解讀成實際停留時間。
+`battery_probe` 是離線硬體診斷工具，用來比較 RFID 按需供電、Light-sleep 與 RFID 常開參考模式。它不建立正式如廁紀錄、不連 Wi-Fi、不寫 Google Sheets，也不把測試記錄中的開機後經過時間（uptime）解讀成實際停留時間。
 
 ## 固定參數
 
@@ -14,7 +14,7 @@ RFID ON/OFF 使用 GPIO1，VL53L0X 使用 GPIO5/GPIO6，RFID RX 使用 GPIO44。
 
 ## 測試模式
 
-| 指令 | 模式 | RFID / sleep | 結束條件 |
+| 指令 | 模式 | RFID／睡眠 | 結束條件 |
 |---|---|---|---|
 | `a` | gated + awake | RFID 按需開啟；CPU 不進 Light-sleep | 首次 `<200 mm` 後 60 秒，或等待 15 分鐘未觸發 |
 | `b` | gated + Light-sleep | RFID 按需開啟；允許 Light-sleep | 同上；一般驗證優先使用此模式 |
@@ -35,7 +35,7 @@ RFID ON/OFF 使用 GPIO1，VL53L0X 使用 GPIO5/GPIO6，RFID RX 使用 GPIO44。
 5. 拔除電腦 USB，再用實際電池／MT3608 供電完成測試。量測期間不輸出 Serial，也不寫 Flash。
 6. 測試記錄完成後會存入獨立 NVS `battery-probe` 命名空間。接回 USB，必要時 RESET，再送 `d` 讀取。
 
-未成功保存或 `interrupted_run` 非零時，不應把舊記錄當成本次測試結果。
+若本次記錄未成功保存或 `interrupted_run` 非零，不應把舊記錄當成本次測試結果。
 
 ## 輸出解讀
 
