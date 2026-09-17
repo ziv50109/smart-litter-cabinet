@@ -1,4 +1,3 @@
-
 # Google Apps Script backend
 
 1. Create an Apps Script project and paste in `Code.gs`.
@@ -6,17 +5,35 @@
 3. Deploy as a Web App that executes as the owner. Device access is allowed, but every POST still requires token authentication.
 4. Put the HTTPS `/exec` URL and token in the local `firmware/main/secrets.h`.
 
-The receiver accepts only `device_token` and `session` at the top level, with the existing nine English protocol fields and no added fields. The sheet displays a fixed set of nine Chinese headers while Apps Script writes values in English-key order. On upgrade, the exact legacy English header row and the previous Chinese header row are migrated; invalid or extra columns remain rejected. It validates JSON types, integer fields, ranges, and the actual UTF-8 request size; prevents formula injection; rejects unexpected fields; deduplicates by `session_id`; and uses Script Lock for concurrent writes. `enter_time` and `exit_time` must both be empty (unknown offline event time) or both be UTC `YYYY-MM-DDTHH:mm:ssZ`; when present, ordering and `duration_sec` (within about two seconds) are checked. Historical timestamps have no lower cutoff, but timestamps more than ten minutes in the future are rejected. Error responses expose only safe error codes, never the token, spreadsheet ID, or stack trace.
+The receiver accepts only `device_token` and `session` at the top level, with the existing nine English protocol fields and no added fields. It validates JSON types, ranges, request size, timestamps, duration consistency, unexpected fields, duplicates by `session_id`, and uses Script Lock for concurrent writes.
 
-UTC remains the API transport format. When data is written to Google Sheets, `enter_time` and `exit_time` are stored as actual spreadsheet date/time values instead of ISO text. The spreadsheet time zone is enforced as `Asia/Taipei`, and those columns are displayed as `yyyy/MM/dd HH:mm:ss`. Existing ISO timestamp strings in the two time columns are migrated once on the first request after deployment, so existing rows become sortable and usable with normal Sheets date/time functions as well.
+## Storage contract
 
-The API field remains `duration_sec` and still carries integer seconds. In Google Sheets, the column header is displayed as `停留時間`; Apps Script stores it as a spreadsheet duration value and displays it as `[mm]:ss` (for example, `241` seconds becomes `04:01`). Existing numeric second values are migrated at the same time as the timestamp migration. `sample_count` remains the number of valid VL53L0X distance samples collected during the session.
+The API contract remains UTC ISO timestamps plus integer seconds. Google Sheets stores the same semantics using Sheet-native numeric types so presentation can be controlled with normal Sheet formatting:
 
-Legacy numeric seconds are migrated as self-contained formulas such as `=241/86400`. Their result is still a numeric duration; retaining the original seconds in the same cell makes retries safe, including `86400` seconds (`1440:00`). New API rows store numeric day fractions directly. Migration markers include the version, spreadsheet ID, and sheet ID. Legacy headers are renamed only after the migrated values and formats have been flushed. Duplicate requests repair the stored row's date/duration formats before reporting success.
+- `enter_time` / `exit_time`: API receives UTC ISO strings such as `2026-09-16T14:37:57Z`; the Sheet stores the same instant as a real date/time value.
+- `duration_sec`: API receives integer seconds such as `81`; the Sheet stores the equivalent duration serial (`81 / 86400`).
+- The display header is `停留時間`.
+- The backend does **not** change the spreadsheet locale or time zone.
+- The backend does **not** apply number/date formats. Configure display formatting in Google Sheets itself.
 
-Back up the sheet before upgrading, and do not manually rename legacy headers or edit/reorder rows during migration. Completed earlier duration revisions using `[m]:ss` are accepted without another division. If an earlier experimental revision already renamed the header but left unformatted numeric values, the unit may be ambiguous (for example, `1` second versus `1` day). The receiver returns `storage_error` rather than guessing. Restore the affected duration column and its old header from the pre-upgrade backup before retrying; this cannot reconstruct values already corrupted by an older revision. Legacy duration formulas other than the explicit seconds/day conversion also require manual unit verification.
+Recommended Sheet settings:
 
-After copying the updated `backend/Code.gs` into your Apps Script project, create a new Web App deployment version (Deploy → Manage deployments → Edit → New version → Deploy). The existing `/exec` URL can remain unchanged.
+- Spreadsheet time zone: your desired display zone, e.g. `(GMT+08:00) Taipei`.
+- Columns D:E (`進入時間`, `離開時間`): custom date/time format such as `yyyy/MM/dd HH:mm:ss`.
+- Column F (`停留時間`): custom number format `[mm]:ss` so 81 seconds displays as `01:21`.
+
+Changing the spreadsheet time zone changes how D:E are displayed because they are real timestamps. It does not change duration semantics in F.
+
+For compatibility, an exact old English protocol header row or the previous Chinese header row using `停留秒數` is renamed to the current Chinese display headers. Existing historical data cells are not automatically converted; if an older deployment already wrote strings or raw seconds, correct those rows separately before applying one format to the entire column.
+
+`sample_count` is the number of valid VL53L0X distance samples collected during the session.
+
+## Manual Apps Script smoke test
+
+Run `doTest()` from the Apps Script editor. It writes one clearly marked `TEST` row through the same `doPost()` path, using the configured `DEVICE_TOKEN` and a unique test `session_id`. With D:E formatted as `yyyy/MM/dd HH:mm:ss` and F formatted as `[mm]:ss`, the test row should show a normal local timestamp and `01:21` duration.
+
+After changing `Code.gs`, create a new Web App deployment version (Deploy → Manage deployments → Edit → New version → Deploy). The existing `/exec` URL can remain unchanged.
 
 Success returns `{"ok":true}`; a retried `session_id` returns `{"ok":true,"duplicate":true}`. Failures return `ok: false` with codes such as `unauthorized`, `invalid_*`, `inconsistent_time_duration`, `busy`, `server_not_configured`, or `storage_error`.
 
@@ -31,17 +48,35 @@ The ESP32 token is a bearer secret and can be recovered by someone with physical
 3. 部署 Web App：Execute as owner，access 允許裝置呼叫，但每筆 POST 仍必須通過 token 驗證。
 4. 將 `/exec` HTTPS URL 與 token 填入本機 `firmware/main/secrets.h`。
 
-接收端只接受 `device_token` 與 `session` 兩個頂層欄位；`session` 必須包含原有的 9 個英文通訊欄位，沒有新增欄位。工作表顯示使用固定的 9 個中文表頭，Apps Script 依英文欄位順序寫入；部署升級時會遷移完全相符的舊英文表頭與前一版中文表頭，之後仍嚴格拒絕錯誤或多餘欄位。它會驗證 JSON 類型、整數欄位與範圍、實際 UTF-8 request 大小，拒絕公式注入與多餘欄位，用 `session_id` 去重，並用 Script Lock 防止並行寫入。`enter_time`/`exit_time` 必須同時為空（表示離線事件時間未知），或同時為 UTC `YYYY-MM-DDTHH:mm:ssZ`；有時間時也會驗證先後順序及 `duration_sec`（容許約 2 秒誤差）。歷史時間不設下限，但拒絕超過伺服器現在時間 10 分鐘的未來時間。錯誤回應只提供安全錯誤碼，不回傳 token、Spreadsheet ID 或 stack trace。
+接收端只接受 `device_token` 與 `session` 兩個頂層欄位，維持既有 9 個英文通訊欄位。後端負責驗證 JSON、數值範圍、request 大小、時間合法性、停留秒數一致性、多餘欄位與 `session_id` 去重，並用 Script Lock 防止並行寫入。
 
-API 傳輸格式仍維持 UTC，不需要修改 ESP32。寫入 Google Sheets 時，`enter_time` / `exit_time` 會改存真正的日期時間值，而不是 ISO 文字；試算表時區會固定為 `Asia/Taipei`，兩欄顯示格式為 `yyyy/MM/dd HH:mm:ss`。部署新版後第一次收到 request 時，也會把這兩欄既有的 ISO 時間字串遷移成真正日期時間，因此舊資料也能正常排序、篩選及使用 Sheets 日期函式。
+## 儲存契約
 
-API 欄位仍維持 `duration_sec`，傳輸與驗證語意仍是整數秒數；Google Sheets 的欄名則顯示為「停留時間」，寫入時轉成真正的 duration 並以 `[mm]:ss` 顯示，例如 `241` 秒會顯示成 `04:01`。既有的秒數資料會和日期時間一起在首次 request 時自動遷移。`sample_count` 則代表該次 session 期間取得的有效 VL53L0X 距離取樣數。
+API contract 仍維持 UTC ISO timestamp 與整數秒；Google Sheets 則使用 Sheet 原生可格式化的數值型別保存相同語意：
 
-舊秒數會遷移成 `=241/86400` 這種自帶原始秒數的公式；計算結果仍是可排序與計算的數值型 duration。原值與單位換算同時存在同一格，因此中斷重試不會再次除以 86400；一天會維持 `1440:00`。新 API 紀錄直接存數值型天數。遷移標記包含版本、Spreadsheet ID 與工作表 ID，舊表頭只會在資料與格式 flush 成功後更名。重送相同紀錄時會先補齊該列的日期／duration 格式，再回覆成功。
+- `enter_time` / `exit_time`：API 接收 `2026-09-16T14:37:57Z` 這類 UTC ISO 字串；Sheet 寫入代表同一個時間點的真正日期時間值。
+- `duration_sec`：API 仍接收整數秒，例如 `81`；Sheet 寫入等價的 duration serial，也就是 `81 / 86400`。
+- Sheet 顯示欄名使用「停留時間」。
+- 後端**不修改**試算表的地區或時區。
+- 後端**不套用**日期時間或 duration 顯示格式；顯示方式由 Google Sheets 自己設定。
 
-升級前先備份工作表；不要自行更名舊表頭，也不要在遷移期間手動編輯或重新排列資料列。前期版本已完成換算、格式為 `[m]:ss` 的資料會直接沿用，不重複換算。如果曾部署中途版本，表頭已更名但留下未格式化的數值，可能無法辨識單位（例如 `1` 是一秒或一天）；此時回傳 `storage_error`，不猜測或重複除法。請由升級前備份還原受影響的停留欄位及舊表頭後重試；舊版已改壞的數值無法憑空復原。舊秒數欄若有人工作成其他公式，也需先人工核對單位。
+建議 Google Sheet 設定：
 
-把更新的 `backend/Code.gs` 貼回 Apps Script 專案後，需要到「部署 → 管理部署作業 → 編輯 → 建立新版本 → 部署」。原本的 `/exec` URL 可以維持不變。
+- 試算表時區：依你希望的顯示時區，例如 `(GMT+08:00) 台北`。
+- D:E 欄（進入時間／離開時間）：自訂日期時間格式 `yyyy/MM/dd HH:mm:ss`。
+- F 欄（停留時間）：自訂數字格式 `[mm]:ss`，因此 81 秒會顯示為 `01:21`。
+
+更改試算表時區後，D:E 的顯示會跟著變，因為它們是真正的 timestamp；F 是 duration，不受時區影響。
+
+為了相容既有 Sheet，若表頭完整符合舊英文 protocol 欄名，或只差第六欄仍為「停留秒數」的舊中文表頭，後端只會改成目前中文表頭。**既有歷史資料不會自動轉型**；如果舊版本已寫入 ISO 字串或整數秒，請先另外修正那些舊列，再對整欄套統一格式。
+
+`sample_count` 代表該次 session 期間取得的有效 VL53L0X 距離取樣數。
+
+## Apps Script 手動測試
+
+在 Apps Script 編輯器直接執行 `doTest()`。它會使用 Script Properties 裡的 `DEVICE_TOKEN`，透過與 ESP32 相同的 `doPost()` 路徑寫入一筆清楚標示為 `TEST` 的測試資料，並產生唯一的 test `session_id`。當 D:E 設成 `yyyy/MM/dd HH:mm:ss`、F 設成 `[mm]:ss` 後，這筆測試資料應顯示正常的本地日期時間，停留時間應為 `01:21`。
+
+修改 `Code.gs` 後，需要到「部署 → 管理部署作業 → 編輯 → 建立新版本 → 部署」。原本的 `/exec` URL 可以維持不變。
 
 正常回應為 `{"ok":true}`，重送已存在的 `session_id` 會回 `{"ok":true,"duplicate":true}`。失敗時 `ok` 為 `false`；常見錯誤碼包括 `unauthorized`、`invalid_*`、`inconsistent_time_duration`、`busy`、`server_not_configured` 及 `storage_error`。
 
@@ -49,14 +84,10 @@ API 欄位仍維持 `duration_sec`，傳輸與驗證語意仍是整數秒數；G
 
 ## Local regression tests / 本機回歸測試
 
-From the repository root (Node.js 22 tested; no package installation required):
+From the repository root:
 
 ```sh
 node --test backend/tests/code.test.cjs
 ```
 
-These tests execute `Code.gs` in a Node VM with in-memory Apps Script service mocks, including before/after-write failures, partial migration writes, per-sheet markers, duplicate repair, unit boundaries, and validation guards. They do **not** execute Apps Script, emulate Sheets rendering, or deploy the Web App.
-
-本機測試只驗證控制流程與故障復原，不等於 Google Sheets 整合驗收。部署後請用測試紀錄確認：UTC `2026-09-16T14:37:57Z` 顯示 `2026/09/16 22:37:57`；0、241、3665 秒分別顯示 `00:00`、`04:01`、`61:05`；`ISNUMBER` 判定日期與停留欄為數值，重送同一 `session_id` 不增加紀錄。
-
-Format reference: https://developers.google.com/workspace/sheets/api/guides/formats#date_and_time_format_tokens
+The tests verify Sheet-native timestamp/duration storage, no backend time-zone/number-format mutation, header compatibility, duplicate idempotency, validation/security guards, and the manual smoke-test helper.
