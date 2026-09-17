@@ -102,6 +102,14 @@ function validate_(session) {
   };
 }
 
+function sheetValue_(key, value) {
+  if ((key === 'enter_time' || key === 'exit_time') && value !== '') {
+    return new Date(value);
+  }
+  if (key === 'duration_sec') return value / 86400;
+  return safeCell_(value);
+}
+
 function ensureSheet_(spreadsheetId) {
   const sheet = SpreadsheetApp.openById(spreadsheetId).getSheets()[0];
   if (sheet.getLastRow() === 0) {
@@ -170,7 +178,7 @@ function doPost(e) {
           return jsonResponse_({ok: true, duplicate: true});
         }
       }
-      sheet.appendRow(FIELD_KEYS.map(key => safeCell_(row[key])));
+      sheet.appendRow(FIELD_KEYS.map(key => sheetValue_(key, row[key])));
     } finally {
       lock.releaseLock();
     }
@@ -182,4 +190,39 @@ function doPost(e) {
     console.error('doPost failed: ' + errorCode);
     return jsonResponse_({ok: false, error: errorCode});
   }
+}
+
+function isoSeconds_(date) {
+  return date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+// Manual Apps Script smoke test. Running this function writes one TEST row
+// to the configured spreadsheet using the same doPost() path as the device.
+function testWriteSample_() {
+  const props = PropertiesService.getScriptProperties();
+  const deviceToken = props.getProperty('DEVICE_TOKEN');
+  if (!deviceToken) throw new Error('DEVICE_TOKEN is not configured');
+
+  const durationSec = 81;
+  const exitTime = new Date();
+  const enterTime = new Date(exitTime.getTime() - durationSec * 1000);
+  const response = doPost({
+    postData: {
+      contents: JSON.stringify({
+        device_token: deviceToken,
+        session: {
+          session_id: 'test-' + Utilities.getUuid(),
+          chip_id: 'ABC123',
+          cat_id: 'TEST',
+          enter_time: isoSeconds_(enterTime),
+          exit_time: isoSeconds_(exitTime),
+          duration_sec: durationSec,
+          min_distance_mm: 46,
+          avg_distance_mm: 108.9,
+          sample_count: 1350,
+        },
+      }),
+    },
+  });
+  console.log(response.getContent());
 }
