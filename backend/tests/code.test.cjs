@@ -41,7 +41,7 @@ function createHarness(initialRows = []) {
   ]);
   let locked = false;
   let timeZoneWriteCount = 0;
-  let numberFormatWriteCount = 0;
+  const numberFormatWrites = [];
   const logs = [];
 
   const sheet = {
@@ -66,8 +66,8 @@ function createHarness(initialRows = []) {
           }
           return this;
         },
-        setNumberFormat() {
-          numberFormatWriteCount++;
+        setNumberFormat(format) {
+          numberFormatWrites.push({ row, col, rowCount, colCount, format });
           return this;
         },
         createTextFinder(text) {
@@ -141,9 +141,9 @@ function createHarness(initialRows = []) {
   return {
     rows,
     logs,
+    numberFormatWrites,
     context,
     get timeZoneWriteCount() { return timeZoneWriteCount; },
-    get numberFormatWriteCount() { return numberFormatWriteCount; },
     post(session = fixture()) {
       const response = context.doPost({ postData: { contents: JSON.stringify({
         device_token: 'device-token',
@@ -154,7 +154,7 @@ function createHarness(initialRows = []) {
   };
 }
 
-test('stores timestamps and duration as Sheet-native values without presentation writes', () => {
+test('stores native values and formats timestamps and duration on the appended row', () => {
   const h = createHarness();
   const session = fixture();
 
@@ -166,7 +166,10 @@ test('stores timestamps and duration as Sheet-native values without presentation
   assert.equal(h.rows[1][4].toISOString(), '2026-09-16T14:41:58.000Z');
   assert.equal(h.rows[1][5], 241 / DAY);
   assert.equal(h.timeZoneWriteCount, 0);
-  assert.equal(h.numberFormatWriteCount, 0);
+  assert.deepEqual(h.numberFormatWrites, [
+    { row: 2, col: 4, rowCount: 1, colCount: 2, format: 'yyyy/MM/dd HH:mm:ss' },
+    { row: 2, col: 6, rowCount: 1, colCount: 1, format: '[m]:ss' },
+  ]);
 });
 
 test('blank timestamps stay blank and zero-second duration stays zero', () => {
@@ -175,6 +178,10 @@ test('blank timestamps stay blank and zero-second duration stays zero', () => {
   assert.equal(h.rows[1][3], '');
   assert.equal(h.rows[1][4], '');
   assert.equal(h.rows[1][5], 0);
+  assert.deepEqual(h.numberFormatWrites, [
+    { row: 2, col: 4, rowCount: 1, colCount: 2, format: 'yyyy/MM/dd HH:mm:ss' },
+    { row: 2, col: 6, rowCount: 1, colCount: 1, format: '[m]:ss' },
+  ]);
 });
 
 test('renames previous Chinese header only and leaves existing data untouched', () => {
@@ -185,6 +192,10 @@ test('renames previous Chinese header only and leaves existing data untouched', 
   assert.deepEqual(h.post(fixture({ session_id: 'session-new' })), { ok: true });
   assert.deepEqual(h.rows[0], HEADERS);
   assert.deepEqual(h.rows[1], existing);
+  assert.deepEqual(h.numberFormatWrites, [
+    { row: 3, col: 4, rowCount: 1, colCount: 2, format: 'yyyy/MM/dd HH:mm:ss' },
+    { row: 3, col: 6, rowCount: 1, colCount: 1, format: '[m]:ss' },
+  ]);
 });
 
 test('renames legacy English header only and leaves existing data untouched', () => {
@@ -197,7 +208,7 @@ test('renames legacy English header only and leaves existing data untouched', ()
   assert.deepEqual(h.rows[1], existing);
 });
 
-test('duplicate session is idempotent and does not rewrite data', () => {
+test('duplicate session is idempotent and does not rewrite data or formats', () => {
   const existing = [
     fixture().session_id,
     fixture().chip_id,
@@ -215,7 +226,7 @@ test('duplicate session is idempotent and does not rewrite data', () => {
   assert.deepEqual(h.post(), { ok: true, duplicate: true });
   assert.deepEqual(h.rows, snapshot);
   assert.equal(h.timeZoneWriteCount, 0);
-  assert.equal(h.numberFormatWriteCount, 0);
+  assert.deepEqual(h.numberFormatWrites, []);
 });
 
 test('duration validation still enforces source seconds', () => {
