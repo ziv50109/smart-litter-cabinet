@@ -28,6 +28,29 @@ inline bool safeSessionId(const char *text) {
   }
   return true;
 }
+
+enum class QueuedTimestampState : uint8_t { Ready, WaitForClock, Unrecoverable };
+inline QueuedTimestampState queuedTimestampState(const char *stamp, const char *bootId, bool clockValid) {
+  if (!stamp || !*stamp) return QueuedTimestampState::Unrecoverable;
+  if (*stamp != '@') return QueuedTimestampState::Ready;
+  const char *colon = strchr(stamp + 1, ':');
+  if (!colon || colon == stamp + 1 || !bootId || !*bootId) return QueuedTimestampState::Unrecoverable;
+  const size_t tokenLen = size_t(colon - (stamp + 1));
+  if (strlen(bootId) != tokenLen || strncmp(stamp + 1, bootId, tokenLen) != 0) {
+    return QueuedTimestampState::Unrecoverable;
+  }
+  const char *digits = colon + 1;
+  if (!*digits) return QueuedTimestampState::Unrecoverable;
+  for (const char *p = digits; *p; ++p) {
+    if (*p < '0' || *p > '9') return QueuedTimestampState::Unrecoverable;
+  }
+  return clockValid ? QueuedTimestampState::Ready : QueuedTimestampState::WaitForClock;
+}
+inline bool queueHeadUnrecoverable(const char *enterTime, const char *exitTime, const char *bootId, bool clockValid) {
+  return queuedTimestampState(enterTime, bootId, clockValid) == QueuedTimestampState::Unrecoverable ||
+         queuedTimestampState(exitTime, bootId, clockValid) == QueuedTimestampState::Unrecoverable;
+}
+
 struct Window {
   uint32_t started = 0, duration = 0;
   void open(uint32_t now, uint32_t ms) { started = now; duration = ms; }
