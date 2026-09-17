@@ -27,7 +27,7 @@ python firmware/tests/main_host/run.py
 
 Arduino loop 單獨擁有感測器、RFID、`visit` 與進行中的統計。另一個 FreeRTOS task 負責 Wi-Fi、NTP、HTTP 上傳、診斷檔案及管理服務；同步網路等待不在量距執行路徑上。跨 task 的感測快照／OTA 預約、NVS 佇列、即時 log 與手動睡眠分別同步；不在 HTTP 傳輸期間持有 NVS 或感測鎖。
 
-可信事件先寫入 NVS，再交由網路 task 傳送；上傳確認後更新環形佇列索引。未取得時鐘時，先保存帶本次 boot 識別的單調時間，於同一次開機取得 NTP 後轉成時間戳並保存，再上傳。沒有可信時間的舊紀錄會保留並回報 `timestamp unavailable`，不猜測日期；未同步時就斷電的時間無法事後從另一個 boot 還原。
+可信事件先寫入 NVS，再交由網路 task 傳送；上傳確認後更新環形佇列索引。未取得時鐘時，先保存帶本次 boot 識別的單調時間，於同一次開機取得 NTP 後轉成時間戳並保存，再上傳。若裝置在同步時間前重開機，舊 boot 的單調時間無法可靠還原成日期；這類永久不可恢復的 queue head 不會偽造時間，也不會永久阻塞 FIFO，而是先寫入 `queue_quarantine` 診斷後移出待傳佇列，讓後續正常紀錄繼續處理。同一 boot 只是暫時等不到 NTP 的紀錄仍會保留等待，不會被誤丟。
 
 完整診斷透過固定容量快照佇列交接。佇列滿時不阻塞偵測，`diagnostics_dropped` 與即時 `diagnostic_overflow` 顯示遺失；已寫入 NVS 的使用紀錄不受診斷快照遺失影響。Flash 寫入及系統排程仍可能造成延遲，因此狀態提供跨事件的 `global_max_gap_ms`，不以「使用另一個 task」取代量測驗證。
 
