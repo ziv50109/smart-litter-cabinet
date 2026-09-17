@@ -31,7 +31,7 @@ For compatibility, an exact old English protocol header row or the previous Chin
 
 ## Manual Apps Script smoke test
 
-Run `testWriteSample_()` from the Apps Script editor. It writes one clearly marked `TEST` row through the same `doPost()` path, using the configured `DEVICE_TOKEN` and a unique test `session_id`. With D:E formatted as `yyyy/MM/dd HH:mm:ss` and F formatted as `[mm]:ss`, the test row should show a normal local timestamp and `01:21` duration.
+Run `doTest()` from the Apps Script editor. It writes one clearly marked `TEST` row through the same `doPost()` path, using the configured `DEVICE_TOKEN` and a unique test `session_id`. With D:E formatted as `yyyy/MM/dd HH:mm:ss` and F formatted as `[mm]:ss`, the test row should show a normal local timestamp and `01:21` duration.
 
 After changing `Code.gs`, create a new Web App deployment version (Deploy → Manage deployments → Edit → New version → Deploy). The existing `/exec` URL can remain unchanged.
 
@@ -74,7 +74,7 @@ API contract 仍維持 UTC ISO timestamp 與整數秒；Google Sheets 則使用 
 
 ## Apps Script 手動測試
 
-在 Apps Script 編輯器直接執行 `testWriteSample_()`。它會使用 Script Properties 裡的 `DEVICE_TOKEN`，透過與 ESP32 相同的 `doPost()` 路徑寫入一筆清楚標示為 `TEST` 的測試資料，並產生唯一的 test `session_id`。當 D:E 設成 `yyyy/MM/dd HH:mm:ss`、F 設成 `[mm]:ss` 後，這筆測試資料應顯示正常的本地日期時間，停留時間應為 `01:21`。
+在 Apps Script 編輯器直接執行 `doTest()`。它會使用 Script Properties 裡的 `DEVICE_TOKEN`，透過與 ESP32 相同的 `doPost()` 路徑寫入一筆清楚標示為 `TEST` 的測試資料，並產生唯一的 test `session_id`。當 D:E 設成 `yyyy/MM/dd HH:mm:ss`、F 設成 `[mm]:ss` 後，這筆測試資料應顯示正常的本地日期時間，停留時間應為 `01:21`。
 
 修改 `Code.gs` 後，需要到「部署 → 管理部署作業 → 編輯 → 建立新版本 → 部署」。原本的 `/exec` URL 可以維持不變。
 
