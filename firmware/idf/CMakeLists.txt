@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+set(IDF_TARGET esp32s3)
+set(LC_CONNECTED 0 CACHE STRING "Enable optional connected standby")
+add_compile_definitions(ARDUINO_USB_MODE=1 ARDUINO_USB_CDC_ON_BOOT=1 CORE_DEBUG_LEVEL=0)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(smart_litter_cabinet)

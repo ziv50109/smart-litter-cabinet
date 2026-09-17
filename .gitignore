@@ -12,12 +12,17 @@ datasets/
 *.png
 !hardware/xy134-wiring.png
 
-# Arduino / PlatformIO output
+# Arduino / PlatformIO / ESP-IDF output
 build/
 .pio/
 *.bin
 *.elf
 *.map
+firmware/idf/sdkconfig
+firmware/idf/sdkconfig.old
+firmware/idf/managed_components/
+firmware/idf/components/arduino/
+firmware/idf/components/vl53l0x/upstream/
 
 # Python
 __pycache__/

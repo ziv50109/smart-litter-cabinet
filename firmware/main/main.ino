@@ -13,9 +13,26 @@
 #include <time.h>
 #include <stdlib.h>
 #include <math.h>
+#include <atomic>
+#include <memory>
+#include <new>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/queue.h>
+#include <esp_pm.h>
+#include <esp_wifi.h>
+#include <esp_ota_ops.h>
+#include <esp_app_format.h>
+#include <esp_app_desc.h>
+#include <esp_arduino_version.h>
+#include "runtime_policy.h"
+#include "trace_buffer.h"
 #include "app_config.h"
 #include "visit_logic.h"
 #include "certificates.h"
+#if ESP_ARDUINO_VERSION < ESP_ARDUINO_VERSION_VAL(3, 3, 11)
+#error "Use Arduino-ESP32 3.3.11 or newer for the management authentication implementation."
+#endif
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -27,7 +44,40 @@
 #define DEBUG_WEB_SERVER false
 #endif
 
-static const char *FW_VERSION = "main-2026-09-16";
+#ifndef WEB_ADMIN_USER
+#define WEB_ADMIN_USER ""
+#endif
+#ifndef WEB_ADMIN_PASSWORD
+#define WEB_ADMIN_PASSWORD ""
+#endif
+#ifndef LITTER_CONNECTED_STANDBY
+#define LITTER_CONNECTED_STANDBY 0
+#endif
+
+static const char *FW_VERSION = "main-2026-09-17";
+
+struct ScopedLock {
+  SemaphoreHandle_t handle;
+  bool held;
+  explicit ScopedLock(SemaphoreHandle_t h, TickType_t wait = portMAX_DELAY)
+    : handle(h), held(h && xSemaphoreTake(h, wait) == pdTRUE) {}
+  ~ScopedLock() { if (held) xSemaphoreGive(handle); }
+  ScopedLock(const ScopedLock &) = delete;
+  ScopedLock &operator=(const ScopedLock &) = delete;
+};
+SemaphoreHandle_t sensorMutex, queueMutex, diagMutex, logMutex, powerGate;
+QueueHandle_t freeDiagnostics, readyDiagnostics;
+std::atomic<uint32_t> maintenanceRequest{0};
+std::atomic<bool> otaPaused{false};
+std::atomic<bool> connectedStandby{false};
+std::atomic<bool> automaticPm{false};
+std::atomic<const char *> powerReason{"offline_selected"};
+String bootId;
+uint32_t globalMaxGap = 0, lastCompletedRange = 0, diagnosticsDropped = 0;
+#if CONFIG_PM_ENABLE
+esp_pm_lock_handle_t rfidSleepLock = nullptr, rfidClockLock = nullptr;
+#endif
+
 
 struct SessionRecord {
   String session_id, chip_id, cat_id, enter_time, exit_time;
@@ -37,7 +87,13 @@ struct SessionRecord {
   uint32_t sample_count = 0;
 };
 
+struct ScanMetrics {
+  uint32_t scans = 0, bytes = 0, recognized = 0, onMs = 0;
+  uint32_t firstByteMs = UINT32_MAX, validMs = UINT32_MAX;
+  Visit::ScanResult result = Visit::ScanResult::None;
+};
 struct SessionMetrics {
+  ScanMetrics entryScan, exitScan;
   bool open = false;
   uint32_t started = 0;
   uint32_t samples = 0, invalid = 0, maxGap = 0, lastSample = 0;
@@ -48,14 +104,17 @@ struct SessionMetrics {
   uint32_t sleepMs = 0, sleepCalls = 0, sleepErrors = 0;
 };
 
-struct TraceSample { uint32_t ms; uint16_t mm; uint8_t flags; };
-struct TraceEvent { uint32_t ms; uint8_t code; uint8_t value; uint16_t aux; };
-constexpr uint16_t TRACE_CAP = 512;
-constexpr uint8_t TRACE_EVENT_CAP = 48;
-TraceSample traceSamples[TRACE_CAP];
-TraceEvent traceEvents[TRACE_EVENT_CAP];
-uint16_t traceHead = 0, traceCount = 0;
-uint8_t traceEventCount = 0;
+using TraceBuffer = Trace::Buffer<Config::TRACE_SAMPLE_CAP, Config::TRACE_EVENT_CAP>;
+TraceBuffer trace;
+struct DiagnosticSnapshot {
+  TraceBuffer trace;
+  SessionMetrics metrics;
+  String sid, cat;
+  Visit::Reason reason = Visit::Reason::None;
+  uint32_t durationMs = 0, elapsedMs = 0, maxGlobalGap = 0;
+  bool recordQueued = false;
+};
+DiagnosticSnapshot diagnosticSnapshots[Config::DIAG_SNAPSHOT_SLOTS];
 
 VL53L0X tof;
 HardwareSerial rfidSerial(1);
@@ -76,12 +135,12 @@ uint32_t lastRangeMs = 0;
 uint32_t invalidDistanceSinceMs = 0;
 uint32_t lastTofInitAttemptMs = 0;
 
-bool webRoutesReady = false, webRunning = false;
-enum class NetMode { Off, Sta, Ap };
-NetMode netMode = NetMode::Off;
-uint32_t maintenanceStarted = 0, maintenanceDuration = 0;
-bool maintenanceSticky = false;
-bool otaStarted = false, otaFailed = false;
+bool webRoutesReady = false, webRunning = false; // Network-task owned.
+enum class NetMode { Off, Sta };
+std::atomic<NetMode> netMode{NetMode::Off};
+Runtime::Window maintenanceWindow;
+Runtime::Backoff reconnectBackoff;
+bool maintenanceSticky = DEBUG_WEB_SERVER;
 
 struct LiveLog { uint32_t ms; char action[32]; char detail[80]; };
 constexpr uint8_t LIVE_LOG_CAP = 64;
@@ -89,6 +148,7 @@ LiveLog liveLogs[LIVE_LOG_CAP];
 uint32_t liveSeq = 0;
 
 void logLive(const char *action, const String &detail = "") {
+  ScopedLock guard(logMutex);
   LiveLog &r = liveLogs[liveSeq++ % LIVE_LOG_CAP];
   r.ms = millis();
   strlcpy(r.action, action, sizeof(r.action));
@@ -114,28 +174,47 @@ String catForChip(const String &chip) {
 }
 bool registeredChip(const String &chip) { return catForChip(chip).length() > 0; }
 
-void traceReset() { traceHead = traceCount = 0; traceEventCount = 0; }
+void traceReset() { trace.reset(); }
+void traceEvent(uint8_t code, uint8_t value = 0, uint16_t aux = 0) {
+  if (metrics.open) trace.event({millis(), code, value, aux}, code == 10);
+}
 void traceSample(uint32_t ms, uint16_t mm, bool valid, bool blocked) {
   if (!metrics.open) return;
-  TraceSample s{ms, mm, (uint8_t)((valid ? 1 : 0) | (blocked ? 2 : 0) | (rfidPower ? 4 : 0))};
-  if (traceCount < TRACE_CAP) traceSamples[(traceHead + traceCount++) % TRACE_CAP] = s;
-  else { traceSamples[traceHead] = s; traceHead = (traceHead + 1) % TRACE_CAP; }
+  trace.add({ms, mm, uint8_t((valid ? 1 : 0) | (blocked ? 2 : 0) | (rfidPower ? 4 : 0))});
+  const uint8_t state = !valid ? 0 : blocked ? 2 : 1;
+  if (state != trace.lastDistanceState) {
+    trace.event({ms, 7, state, 0});
+    trace.lastDistanceState = state;
+  }
 }
-void traceEvent(uint8_t code, uint8_t value = 0, uint16_t aux = 0) {
-  if (!metrics.open || traceEventCount >= TRACE_EVENT_CAP) return;
-  traceEvents[traceEventCount++] = TraceEvent{millis(), code, value, aux};
-}
+ScanMetrics &currentScanMetrics() { return visit.exitScan ? metrics.exitScan : metrics.entryScan; }
 
 void rfidSet(bool on) {
   if (rfidPower == on) return;
   uint32_t now = millis();
+#if CONFIG_PM_ENABLE
+  if (on && automaticPm.load()) {
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(rfidSleepLock));
+    ESP_ERROR_CHECK(esp_pm_lock_acquire(rfidClockLock));
+  }
+#endif
   digitalWrite(Config::RFID_ENABLE_PIN, on ? HIGH : LOW);
   if (on) { rfidPowerAt = now; traceEvent(1); }
   else {
-    if (metrics.open) metrics.rfidOnMs += uint32_t(now - rfidPowerAt);
+    if (metrics.open) {
+      metrics.rfidOnMs += uint32_t(now - rfidPowerAt);
+      currentScanMetrics().onMs += uint32_t(now - rfidPowerAt);
+      currentScanMetrics().result = visit.scanResult;
+    }
     traceEvent(2);
   }
   rfidPower = on;
+#if CONFIG_PM_ENABLE
+  if (!on && automaticPm.load()) {
+    ESP_ERROR_CHECK(esp_pm_lock_release(rfidClockLock));
+    ESP_ERROR_CHECK(esp_pm_lock_release(rfidSleepLock));
+  }
+#endif
   logLive(on ? "rfid_on" : "rfid_off", String("scan=") + visit.scanGeneration);
 }
 
@@ -165,7 +244,7 @@ void syncRfidPower() {
     rfidReceiving = false;
     rfidFrame = "";
     while (rfidSerial.available()) rfidSerial.read();
-    if (metrics.open) ++metrics.scanCount;
+    if (metrics.open) { ++metrics.scanCount; ++currentScanMetrics().scans; }
     traceEvent(3, visit.exitScan ? 1 : 0);
     logLive("scan_start", visit.exitScan ? "exit" : "entry");
   }
@@ -173,16 +252,21 @@ void syncRfidPower() {
 }
 
 void pollRfid() {
+  const Visit::Phase before = visit.phase;
   visit.tick(millis());
+  if (visit.phase != before) traceEvent(8, uint8_t(visit.phase));
   syncRfidPower();
   for (unsigned budget = 0; budget < 96 && rfidSerial.available(); ++budget) {
     char c = (char)rfidSerial.read();
     if (!visit.scanning) continue;
-    if (metrics.open) ++metrics.bytes;
+    if (metrics.open) { ++metrics.bytes; ++currentScanMetrics().bytes; }
     if (!rfidFirstByte) {
       rfidFirstByte = true;
       uint32_t latency = uint32_t(millis() - visit.scanStarted);
-      if (metrics.open) metrics.firstByteMinMs = min(metrics.firstByteMinMs, latency);
+      if (metrics.open) {
+        metrics.firstByteMinMs = min(metrics.firstByteMinMs, latency);
+        currentScanMetrics().firstByteMs = min(currentScanMetrics().firstByteMs, latency);
+      }
       traceEvent(4, 0, (uint16_t)min(latency, 65535UL));
       logLive("rfid_byte", String(latency) + "ms");
     }
@@ -195,14 +279,18 @@ void pollRfid() {
       String cat = catForChip(chip);
       uint32_t latency = uint32_t(millis() - visit.scanStarted);
       if (!cat.length()) { if (metrics.open) ++metrics.otherValid; traceEvent(5, 0, (uint16_t)min(latency,65535UL)); continue; }
+      const Visit::Phase beforeChip = visit.phase;
       if (visit.acceptChip(millis(), chip.c_str())) {
         if (metrics.open) {
           ++metrics.recognized;
+          ++currentScanMetrics().recognized;
+          currentScanMetrics().validMs = min(currentScanMetrics().validMs, latency);
           metrics.validMinMs = min(metrics.validMinMs, latency);
         }
         traceEvent(5, chip == CAT_1_CHIP_RAW ? 1 : 2, (uint16_t)min(latency,65535UL));
         logLive("rfid_valid", cat + " " + String(latency) + "ms");
       }
+      if (visit.phase != beforeChip) traceEvent(8, uint8_t(visit.phase));
       syncRfidPower();
       continue;
     }
@@ -250,7 +338,12 @@ String formatIso(time_t epoch) {
   strftime(b, sizeof(b), "%Y-%m-%dT%H:%M:%SZ", &t); return String(b);
 }
 String epochForUptime(uint32_t targetMs) {
-  if (!timeValid()) return "";
+  if (!timeValid()) {
+    // Durable same-boot timestamp, resolved after NTP without blocking detection.
+    const uint64_t target = uint64_t(esp_timer_get_time() / 1000) - uint32_t(millis() - targetMs);
+    char number[24]; snprintf(number, sizeof(number), "%llu", (unsigned long long)target);
+    return "@" + bootId + ":" + number;
+  }
   time_t now = time(nullptr);
   uint32_t delta = uint32_t(millis() - targetMs) / 1000UL;
   return formatIso(now - delta);
@@ -353,6 +446,7 @@ bool loadQueueMeta(uint8_t &head, uint8_t &count) {
   return true;
 }
 uint8_t pendingCount() {
+  ScopedLock guard(queueMutex);
   uint8_t head = 0, count = 0;
   return loadQueueMeta(head, count) ? count : 0;
 }
@@ -379,6 +473,7 @@ bool decodeRecord(const String &encoded, SessionRecord &r) {
   return true;
 }
 bool enqueueRecord(const SessionRecord &r) {
+  ScopedLock guard(queueMutex);
   uint8_t head = 0, count = 0;
   if (!loadQueueMeta(head, count) || count >= Config::MAX_PENDING_RECORDS) return false;
   const uint8_t tail = (head + count) % Config::MAX_PENDING_RECORDS;
@@ -397,16 +492,48 @@ bool popRecord() {
 
 bool connectSta(uint32_t timeoutMs) {
   if (!strlen(WIFI_SSID)) return false;
-  WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
-  uint32_t start=millis();
-  while (WiFi.status()!=WL_CONNECTED && uint32_t(millis()-start)<timeoutMs) delay(50);
-  if (WiFi.status()==WL_CONNECTED) { netMode=NetMode::Sta; return true; }
-  WiFi.disconnect(true,false); WiFi.mode(WIFI_OFF); netMode=NetMode::Off; return false;
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false); // Retry policy is bounded and owned by networkTask.
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint32_t started = millis();
+  while (WiFi.status() != WL_CONNECTED && uint32_t(millis() - started) < timeoutMs) delay(50);
+  if (WiFi.status() == WL_CONNECTED) {
+    netMode.store(NetMode::Sta);
+    if (connectedStandby.load() && !WiFi.setSleep(WIFI_PS_MIN_MODEM)) {
+      connectedStandby.store(false);
+      powerReason.store("wifi_power_save_unavailable");
+      logLive("power_fallback", powerReason.load());
+    }
+    return true;
+  }
+  WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF); netMode.store(NetMode::Off);
+  return false;
 }
 void syncClock() {
-  if (timeValid() || WiFi.status()!=WL_CONNECTED) return;
-  configTzTime("UTC0","time.google.com","pool.ntp.org");
-  uint32_t start=millis(); while (!timeValid() && uint32_t(millis()-start)<Config::NTP_TIMEOUT_MS) delay(50);
+  if (timeValid() || WiFi.status() != WL_CONNECTED) return;
+  configTzTime("UTC0", "time.google.com", "pool.ntp.org");
+  uint32_t started = millis();
+  while (!timeValid() && uint32_t(millis() - started) < Config::NTP_TIMEOUT_MS) delay(50);
+}
+
+bool resolveTimestamp(String &stamp) {
+  if (!stamp.startsWith("@")) return stamp.length() > 0;
+  const String prefix = "@" + bootId + ":";
+  if (!timeValid() || !stamp.startsWith(prefix)) return false;
+  const String number = stamp.substring(prefix.length());
+  if (!number.length() || number.length() > 20) return false;
+  uint64_t ms = 0;
+  for (size_t i = 0; i < number.length(); ++i) {
+    if (number[i] < '0' || number[i] > '9') return false;
+    const uint8_t d = number[i] - '0';
+    if (ms > (UINT64_MAX - d) / 10) return false;
+    ms = ms * 10 + d;
+  }
+  const uint64_t now = uint64_t(esp_timer_get_time() / 1000);
+  if (ms > now) return false;
+  stamp = formatIso(time(nullptr) - (now - ms) / 1000);
+  return true;
 }
 
 String recordJson(const SessionRecord &r) {
@@ -440,17 +567,35 @@ bool uploadRecord(const SessionRecord &r) {
 }
 
 void uploadPending() {
+  // Copy under the queue lock, but NEVER hold it across Wi-Fi/NTP/HTTP waits.
+  SessionRecord record;
   uint8_t head = 0, count = 0;
-  if (!loadQueueMeta(head, count) || !count) return;
-  if (netMode!=NetMode::Sta && !connectSta(Config::WIFI_TIMEOUT_MS)) return;
-  syncClock();
-  while (count) {
-    SessionRecord r;
-    if (!decodeRecord(queuePrefs.getString(queueKey(head).c_str(),""),r)) { logLive("queue", "decode/meta failure"); break; }
-    if (!uploadRecord(r)) { logLive("upload", "failed"); break; }
-    logLive("upload", "ok");
-    if (!popRecord() || !loadQueueMeta(head, count)) { logLive("queue", "ack failure"); break; }
+  {
+    ScopedLock guard(queueMutex);
+    if (!loadQueueMeta(head, count) || !count) return;
+    if (!decodeRecord(queuePrefs.getString(queueKey(head).c_str(), ""), record)) {
+      logLive("queue", "decode/meta failure"); return;
+    }
   }
+  syncClock();
+  const bool changedTime = record.enter_time.startsWith("@") || record.exit_time.startsWith("@");
+  if (!resolveTimestamp(record.enter_time) || !resolveTimestamp(record.exit_time)) {
+    logLive("queue", "timestamp unavailable; record retained"); return;
+  }
+  if (changedTime) {
+    ScopedLock guard(queueMutex);
+    const String encoded = encodeRecord(record);
+    if (queuePrefs.putString(queueKey(head).c_str(), encoded) != encoded.length()) return;
+  }
+  if (!uploadRecord(record)) { logLive("upload", "failed"); return; }
+  {
+    ScopedLock guard(queueMutex);
+    uint8_t currentHead = 0, currentCount = 0;
+    if (!loadQueueMeta(currentHead, currentCount) || !currentCount || currentHead != head || !popRecord()) {
+      logLive("queue", "ack failure"); return;
+    }
+  }
+  logLive("upload", "ok");
 }
 
 void rotateDiagIfNeeded() {
@@ -463,126 +608,41 @@ void appendDiag(const String &line) {
   if (!spiffsReady) return; rotateDiagIfNeeded();
   File f=SPIFFS.open("/diag.jsonl",FILE_APPEND); if(!f)return; f.println(line); f.close();
 }
-void saveTrace(const String &sessionId) {
-  if (!spiffsReady) return;
-  uint8_t slot=diagPrefs.getUChar("slot",0)%Config::TRACE_SLOTS;
-  String path="/trace"+String(slot)+".csv";
-  File f=SPIFFS.open(path,FILE_WRITE); if(!f)return;
-  f.println("session_id,"+sessionId); f.println("S,uptime_ms,distance_mm,flags(valid=1 blocked=2 rfid=4)");
-  for(uint16_t i=0;i<traceCount;++i){const TraceSample&s=traceSamples[(traceHead+i)%TRACE_CAP]; f.printf("S,%lu,%u,%u\n",(unsigned long)s.ms,s.mm,s.flags);}
-  f.println("E,uptime_ms,code,value,aux");
-  for(uint8_t i=0;i<traceEventCount;++i){const TraceEvent&e=traceEvents[i];f.printf("E,%lu,%u,%u,%u\n",(unsigned long)e.ms,e.code,e.value,e.aux);} f.close();
-  diagPrefs.putUChar("slot",(slot+1)%Config::TRACE_SLOTS);
-}
-
-const char *phaseName() {
-  switch(visit.phase){case Visit::Phase::Idle:return "idle";case Visit::Phase::Candidate:return "candidate";case Visit::Phase::Entry:return "entry";case Visit::Phase::Exit:return "exit";case Visit::Phase::Complete:return "complete";case Visit::Phase::WaitClear:return "wait_clear";} return "?";
-}
-
-String statusJson() {
-  String j="{\"firmware\":\""+String(FW_VERSION)+"\",\"state\":\""+phaseName()+"\",";
-  j+="\"distance_mm\":"+String(latestDistance==UINT16_MAX?-1:latestDistance)+",\"rfid_on\":"+(rfidPower?"true":"false")+",";
-  j+="\"pending\":"+String(pendingCount())+",\"network\":\""+(netMode==NetMode::Sta?"sta":netMode==NetMode::Ap?"ap":"off")+"\"}";
-  return j;
-}
-
-String diagIndexHtml() {
-  String h="<!doctype html><meta name='viewport' content='width=device-width'><h1>診斷資料</h1><p><a href='/diag/current'>目前 JSONL</a> · <a href='/diag/previous'>上一輪 JSONL</a></p><ul>";
-  for(uint8_t i=0;i<Config::TRACE_SLOTS;++i)h+="<li><a href='/trace?slot="+String(i)+"'>trace "+String(i)+"</a></li>";
-  return h+"</ul><p><a href='/'>返回</a></p>";
-}
-
-String liveLogText() {
-  String out; out.reserve(8000);
-  uint32_t total = min(liveSeq, (uint32_t)LIVE_LOG_CAP);
-  uint32_t first = liveSeq > LIVE_LOG_CAP ? liveSeq - LIVE_LOG_CAP : 0;
-  for (uint32_t seq = first; seq < first + total; ++seq) {
-    const LiveLog &r = liveLogs[seq % LIVE_LOG_CAP];
-    out += String(r.ms) + "\t" + r.action + "\t" + r.detail + "\n";
-  }
-  return out;
-}
-
-String mainHtml() {
-  return String("<!doctype html><html lang='zh-Hant'><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{font-family:system-ui;margin:20px}.box{padding:14px;border:1px solid #bbb;margin:12px 0;max-width:760px}button,input{font-size:16px;padding:10px;margin:6px}</style><h1>Smart Litter Cabinet</h1><div id='s' class='box'>讀取中…</div><p><a href='/diagnostics'>診斷資料</a> · <a href='/live'>即時 Log</a></p><div class='box'><h2>Web OTA</h2><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin,application/octet-stream' required><button>上傳並更新</button></form><p>只選 Arduino 匯出的 <code>*.ino.bin</code>。事件進行中會拒絕更新。</p></div><form method='post' action='/normal'><button>關閉維護模式，回低功耗</button></form><script>async function u(){try{let r=await fetch('/api/status',{cache:'no-store'});s.textContent=JSON.stringify(await r.json(),null,2)}catch(e){s.textContent=e}setTimeout(u,1000)}u()</script></html>");
-}
-
-void sendFilePath(const String &path,const char *type) {
-  if(!spiffsReady||!SPIFFS.exists(path)){web.send(404,"text/plain","not found");return;} File f=SPIFFS.open(path,FILE_READ);web.streamFile(f,type);f.close();
-}
-
-void registerWebRoutes() {
-  if(webRoutesReady)return; webRoutesReady=true;
-  web.on("/",HTTP_GET,[](){web.send(200,"text/html; charset=utf-8",mainHtml());});
-  web.on("/api/status",HTTP_GET,[](){web.sendHeader("Cache-Control","no-store");web.send(200,"application/json",statusJson());});
-  web.on("/diagnostics",HTTP_GET,[](){web.send(200,"text/html; charset=utf-8",diagIndexHtml());});
-  web.on("/live",HTTP_GET,[](){web.sendHeader("Cache-Control","no-store");web.send(200,"text/plain; charset=utf-8",liveLogText());});
-  web.on("/diag/current",HTTP_GET,[](){sendFilePath("/diag.jsonl","application/x-ndjson");});
-  web.on("/diag/previous",HTTP_GET,[](){sendFilePath("/diag.prev.jsonl","application/x-ndjson");});
-  web.on("/trace",HTTP_GET,[](){int slot=web.hasArg("slot")?web.arg("slot").toInt():-1;if(slot<0||slot>=Config::TRACE_SLOTS){web.send(400,"text/plain","bad slot");return;}sendFilePath("/trace"+String(slot)+".csv","text/csv");});
-  web.on("/normal",HTTP_POST,[](){web.send(200,"text/plain; charset=utf-8","即將回低功耗模式");maintenanceSticky=false;maintenanceDuration=1;maintenanceStarted=0;});
-  web.on("/update",HTTP_POST,[](){bool ok=otaStarted&&!otaFailed&&!Update.hasError();web.sendHeader("Connection","close");web.send(ok?200:500,"text/plain; charset=utf-8",ok?"更新成功，重新啟動":"更新失敗或事件進行中，保留原韌體");if(ok){delay(400);ESP.restart();}otaStarted=otaFailed=false;},[](){
-    HTTPUpload&u=web.upload();
-    if(u.status==UPLOAD_FILE_START){
-      otaStarted=true; otaFailed=false;
-      if(metrics.open || visit.phase==Visit::Phase::Candidate || visit.phase==Visit::Phase::Entry || visit.phase==Visit::Phase::Exit){otaFailed=true;return;}
-      rfidSet(false); if(!Update.begin(UPDATE_SIZE_UNKNOWN,U_FLASH))otaFailed=true;
-    }else if(u.status==UPLOAD_FILE_WRITE){if(!otaFailed&&Update.write(u.buf,u.currentSize)!=u.currentSize)otaFailed=true;}
-    else if(u.status==UPLOAD_FILE_END){if(!otaFailed&&!Update.end(true))otaFailed=true;}
-    else if(u.status==UPLOAD_FILE_ABORTED){otaFailed=true;Update.abort();}
-  });
-  web.onNotFound([](){web.send(404,"text/plain","not found");});
-}
-
-void startMaintenance(uint32_t durationMs) {
-  if(webRunning){maintenanceStarted=millis();maintenanceDuration=durationMs;return;}
-  if(netMode!=NetMode::Sta && !connectSta(Config::WIFI_TIMEOUT_MS)) { WiFi.mode(WIFI_AP); WiFi.softAP("LitterCabinet"); netMode=NetMode::Ap; }
-  if(netMode==NetMode::Sta) syncClock();
-  registerWebRoutes(); web.begin(); webRunning=true; maintenanceStarted=millis(); maintenanceDuration=durationMs; maintenanceSticky=DEBUG_WEB_SERVER;
-  logLive("web",netMode==NetMode::Sta?WiFi.localIP().toString():WiFi.softAPIP().toString());
-}
-void stopMaintenance() {
-  if(!webRunning)return; web.stop(); webRunning=false;
-  if(netMode==NetMode::Ap)WiFi.softAPdisconnect(true); else if(netMode==NetMode::Sta)WiFi.disconnect(true,false);
-  WiFi.mode(WIFI_OFF);netMode=NetMode::Off;
-}
-void serviceMaintenance() {
-  if(!webRunning)return; web.handleClient();
-  if(!maintenanceSticky && uint32_t(millis()-maintenanceStarted)>=maintenanceDuration)stopMaintenance();
-}
-
-void saveDiagnostics(const String &sid, const String &chip, const String &cat, Visit::Reason reason, uint32_t durationMs) {
-  uint32_t avg=metrics.samples?(uint32_t)(metrics.sumMm/metrics.samples):0;
-  String j="{\"fw\":\""+String(FW_VERSION)+"\",\"session_id\":\""+jsonEscape(sid)+"\",\"reason\":\""+Visit::reasonName(reason)+"\",";
-  j+="\"cat\":\""+jsonEscape(cat)+"\",\"duration_ms\":"+String(durationMs)+",\"samples\":"+String(metrics.samples)+",\"invalid\":"+String(metrics.invalid)+",\"max_gap_ms\":"+String(metrics.maxGap)+",";
-  j+="\"min_mm\":"+String(metrics.minMm==UINT16_MAX?0:metrics.minMm)+",\"avg_mm\":"+String(avg)+",\"scans\":"+String(metrics.scanCount)+",\"recognized\":"+String(metrics.recognized)+",";
-  j+="\"rfid_on_ms\":"+String(metrics.rfidOnMs)+",\"first_byte_ms\":"+String(metrics.firstByteMinMs==UINT32_MAX?0:metrics.firstByteMinMs)+",\"valid_chip_ms\":"+String(metrics.validMinMs==UINT32_MAX?0:metrics.validMinMs)+",";
-  j+="\"bytes\":"+String(metrics.bytes)+",\"bad_frames\":"+String(metrics.badFrames)+",\"sleep_ms\":"+String(metrics.sleepMs)+",\"sleep_calls\":"+String(metrics.sleepCalls)+",\"sleep_errors\":"+String(metrics.sleepErrors)+"}";
-  appendDiag(j); saveTrace(sid);
-}
+#include "management_runtime.h"
 
 void finishSession() {
   rfidSet(false);
-  String chip=String(visit.chip), cat=catForChip(chip), sid=newSessionId();
-  uint32_t durationMs=visit.durationMs(); Visit::Reason reason=visit.reason;
-  saveDiagnostics(sid,chip,cat,reason,durationMs);
-  logLive("session_end", String(Visit::reasonName(reason)) + " " + String(durationMs) + "ms");
-
-  bool trustworthy=reason==Visit::Reason::Normal && durationMs>0 && registeredChip(chip) && !visit.conflict;
-  SessionRecord record;
-  if(trustworthy){
-    record.session_id=sid;record.chip_id=chip;record.cat_id=cat;record.duration_sec=max(1UL,durationMs/1000UL);
-    record.min_distance_mm=metrics.minMm==UINT16_MAX?0:metrics.minMm;
-    record.avg_distance_mm=metrics.samples?(float)metrics.sumMm/metrics.samples:0;
-    record.sample_count=metrics.samples;
-    if(netMode!=NetMode::Sta)connectSta(Config::WIFI_TIMEOUT_MS);if(netMode==NetMode::Sta)syncClock();
-    record.enter_time=epochForUptime(visit.started);record.exit_time=epochForUptime(visit.exitStarted);
-    if(!enqueueRecord(record))logLive("queue","full/write failure");
-  } else logLive("discard",Visit::reasonName(reason));
-
-  visit.release(); metrics.open=false; traceReset();
-  uploadPending();
-  startMaintenance(Config::POST_EVENT_MAINTENANCE_MS);
+  traceEvent(10, uint8_t(visit.reason));
+  const String chip(visit.chip), cat = catForChip(chip), sid = newSessionId();
+  const uint32_t duration = visit.durationMs();
+  const bool trustworthy = visit.reason == Visit::Reason::Normal && duration > 0 && registeredChip(chip) && !visit.conflict;
+  bool queued = false;
+  if (trustworthy) {
+    SessionRecord record;
+    record.session_id = sid; record.chip_id = chip; record.cat_id = cat;
+    record.duration_sec = max(1UL, duration / 1000UL);
+    record.min_distance_mm = metrics.minMm == UINT16_MAX ? 0 : metrics.minMm;
+    record.avg_distance_mm = metrics.samples ? float(metrics.sumMm) / metrics.samples : 0;
+    record.sample_count = metrics.samples;
+    record.enter_time = epochForUptime(visit.started); record.exit_time = epochForUptime(visit.exitStarted);
+    queued = enqueueRecord(record); // Local durable handoff, no network waits.
+    if (!queued) logLive("queue", "full/write failure");
+  }
+  uint8_t slot = 0;
+  if (xQueueReceive(freeDiagnostics, &slot, 0) == pdTRUE) {
+    DiagnosticSnapshot &d = diagnosticSnapshots[slot];
+    d.trace = trace; d.metrics = metrics; d.sid = sid; d.cat = cat;
+    d.reason = visit.reason; d.durationMs = duration;
+    d.elapsedMs = uint32_t(visit.finished - metrics.started);
+    d.maxGlobalGap = globalMaxGap; d.recordQueued = queued;
+    xQueueSend(readyDiagnostics, &slot, 0);
+  } else {
+    ++diagnosticsDropped;
+    logLive("diagnostic_overflow", sid); // Visit record is already durable; never pretend trace was saved.
+  }
+  logLive("session_end", String(Visit::reasonName(visit.reason)) + " " + String(duration) + "ms");
+  visit.release(); metrics.open = false; traceReset();
+  maintenanceRequest.store(Config::POST_EVENT_MAINTENANCE_MS);
 }
 
 void processSensor() {
@@ -590,43 +650,70 @@ void processSensor() {
   uint32_t period=(visit.phase==Visit::Phase::Idle||visit.phase==Visit::Phase::WaitClear)?Config::IDLE_RANGING_PERIOD_MS:Config::ACTIVE_RANGING_PERIOD_MS;
   if(lastRangeMs && uint32_t(now-lastRangeMs)<period)return;
   lastRangeMs=now; uint16_t mm=readDistance(); latestDistance=mm; now=millis();
+  if (lastCompletedRange) globalMaxGap = max(globalMaxGap, uint32_t(now - lastCompletedRange));
+  lastCompletedRange = now;
   Visit::Phase before=visit.phase;
+  const bool armedBefore = visit.exitArmed;
   visit.sample(now,mm!=UINT16_MAX,mm);
   if(before==Visit::Phase::Idle && visit.phase==Visit::Phase::Candidate) metricsBegin(now,mm);
   else if(metrics.open) metricsSample(now,mm);
+  if (visit.phase != before) traceEvent(8, uint8_t(visit.phase));
+  if (visit.exitArmed != armedBefore) traceEvent(9, visit.exitArmed ? 1 : 0);
   if(mm==UINT16_MAX) handleInvalidDistance(now); else invalidDistanceSinceMs=0;
   syncRfidPower();
   if(visit.phase==Visit::Phase::Complete)finishSession();
 }
 
-void maybeSleep() {
-  if(webRunning||netMode!=NetMode::Off||rfidPower)return;
-  uint32_t period=(visit.phase==Visit::Phase::Idle||visit.phase==Visit::Phase::WaitClear)?Config::IDLE_RANGING_PERIOD_MS:Config::ACTIVE_RANGING_PERIOD_MS;
-  uint32_t now=millis(), elapsed=uint32_t(now-lastRangeMs); if(elapsed+5>=period)return;
-  uint32_t ms=period-elapsed-2; int64_t before=esp_timer_get_time();
-  esp_err_t a=esp_sleep_enable_timer_wakeup((uint64_t)ms*1000ULL);esp_err_t r=a==ESP_OK?esp_light_sleep_start():a;
-  if(metrics.open){if(r==ESP_OK){++metrics.sleepCalls;metrics.sleepMs+=(uint32_t)((esp_timer_get_time()-before)/1000);}else ++metrics.sleepErrors;}
-}
+#include "power_runtime.h"
 
 void setup() {
   Serial.begin(115200);
-  pinMode(Config::RFID_ENABLE_PIN,OUTPUT);digitalWrite(Config::RFID_ENABLE_PIN,LOW);
-  pinMode(Config::TOF_INT_PIN,INPUT_PULLUP);
-  rfidSerial.setRxBufferSize(512);rfidSerial.begin(9600,SERIAL_8N1,Config::RFID_RX_PIN,-1);
-  queuePrefs.begin("litter",false);diagPrefs.begin("litter-diag",false);
-  // Diagnostics are expendable; format only if the diagnostics filesystem cannot mount.
-  spiffsReady=SPIFFS.begin(true);
+  pinMode(Config::RFID_ENABLE_PIN, OUTPUT); digitalWrite(Config::RFID_ENABLE_PIN, LOW);
+  pinMode(Config::TOF_INT_PIN, INPUT_PULLUP);
+  sensorMutex = xSemaphoreCreateMutex(); queueMutex = xSemaphoreCreateMutex();
+  diagMutex = xSemaphoreCreateMutex(); logMutex = xSemaphoreCreateMutex(); powerGate = xSemaphoreCreateMutex();
+  freeDiagnostics = xQueueCreate(Config::DIAG_SNAPSHOT_SLOTS, sizeof(uint8_t));
+  readyDiagnostics = xQueueCreate(Config::DIAG_SNAPSHOT_SLOTS, sizeof(uint8_t));
+  configASSERT(sensorMutex && queueMutex && diagMutex && logMutex && powerGate && freeDiagnostics && readyDiagnostics);
+  for (uint8_t i = 0; i < Config::DIAG_SNAPSHOT_SLOTS; ++i) xQueueSend(freeDiagnostics, &i, 0);
+  bootId = String(esp_random(), HEX) + String(esp_random(), HEX);
+  rfidSerial.setRxBufferSize(512); rfidSerial.begin(9600, SERIAL_8N1, Config::RFID_RX_PIN, -1);
+  queuePrefs.begin("litter", false); diagPrefs.begin("litter-diag", false);
+  spiffsReady = SPIFFS.begin(true);
   initTof();
-  startMaintenance(Config::BOOT_MAINTENANCE_MS);
-  if(netMode==NetMode::Sta)uploadPending();
-  logLive("ready",FW_VERSION);
+  WiFi.persistent(false); WiFi.mode(WIFI_OFF);
+  configurePower();
+  Serial.print("Power initialization: "); Serial.println(powerReason.load());
+  maintenanceRequest.store(Config::BOOT_MAINTENANCE_MS);
+  if (xTaskCreate(networkTask, "litter-net", 12288, nullptr, 1, nullptr) != pdPASS) {
+    connectedStandby.store(false);
+    powerReason.store("network_task_init_failed");
+    logLive("network_disabled", "task allocation failed");
+  }
+  logLive("ready", FW_VERSION);
 }
 
 void loop() {
-  serviceMaintenance();
-  pollRfid();
-  processSensor();
-  pollRfid();
-  maybeSleep();
-  delay(1);
+  uint32_t wait = 1;
+  {
+    ScopedLock guard(sensorMutex);
+    static bool wasPaused = false;
+    if (otaPaused.load()) { wasPaused = true; wait = Config::NETWORK_POLL_MS; }
+    else {
+      if (wasPaused) {
+        visit = Visit::Engine{}; visit.phase = Visit::Phase::WaitClear;
+        seenScanGeneration = 0; lastRangeMs = lastCompletedRange = 0;
+        wasPaused = false;
+        logLive("detection", "resumed after OTA; wait for clear");
+      }
+      pollRfid(); processSensor(); pollRfid();
+      maybeSleep();
+      const uint32_t period = (visit.phase == Visit::Phase::Idle || visit.phase == Visit::Phase::WaitClear)
+        ? Config::IDLE_RANGING_PERIOD_MS : Config::ACTIVE_RANGING_PERIOD_MS;
+      const uint32_t elapsed = uint32_t(millis() - lastRangeMs);
+      wait = rfidPower ? 2 : elapsed < period ? period - elapsed : 1;
+    }
+  }
+  // Real blocking deadlines permit tickless idle; do not busy-poll a sleeping network.
+  delay(wait);
 }
