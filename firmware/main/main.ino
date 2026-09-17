@@ -605,8 +605,16 @@ void rotateDiagIfNeeded() {
   SPIFFS.remove("/diag.prev.jsonl"); SPIFFS.rename("/diag.jsonl","/diag.prev.jsonl");
 }
 void appendDiag(const String &line) {
-  if (!spiffsReady) return; rotateDiagIfNeeded();
-  File f=SPIFFS.open("/diag.jsonl",FILE_APPEND); if(!f)return; f.println(line); f.close();
+  if (!spiffsReady) {
+    return;
+  }
+  rotateDiagIfNeeded();
+  File f = SPIFFS.open("/diag.jsonl", FILE_APPEND);
+  if (!f) {
+    return;
+  }
+  f.println(line);
+  f.close();
 }
 #include "management_runtime.h"
 
