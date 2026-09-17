@@ -22,6 +22,8 @@ const SHEET_HEADERS = [
   '取樣次數',
 ];
 
+const DATE_TIME_NUMBER_FORMAT = 'yyyy/MM/dd HH:mm:ss';
+const DURATION_NUMBER_FORMAT = '[m]:ss';
 const MAX_BODY_BYTES = 4096;
 const ALLOWED_TOP_LEVEL_KEYS = new Set(['device_token', 'session']);
 const ALLOWED_SESSION_KEYS = new Set(FIELD_KEYS);
@@ -110,6 +112,11 @@ function sheetValue_(key, value) {
   return safeCell_(value);
 }
 
+function formatRow_(sheet, rowNumber) {
+  sheet.getRange(rowNumber, 4, 1, 2).setNumberFormat(DATE_TIME_NUMBER_FORMAT);
+  sheet.getRange(rowNumber, 6).setNumberFormat(DURATION_NUMBER_FORMAT);
+}
+
 function ensureSheet_(spreadsheetId) {
   const sheet = SpreadsheetApp.openById(spreadsheetId).getSheets()[0];
   if (sheet.getLastRow() === 0) {
@@ -179,6 +186,7 @@ function doPost(e) {
         }
       }
       sheet.appendRow(FIELD_KEYS.map(key => sheetValue_(key, row[key])));
+      formatRow_(sheet, sheet.getLastRow());
     } finally {
       lock.releaseLock();
     }
