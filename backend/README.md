@@ -62,15 +62,15 @@ After changing `Code.gs`, deploy a new Web App version. The existing `/exec` URL
 3. 部署為 Web App，由擁有者身分執行並允許裝置呼叫。
 4. 將 HTTPS `/exec` URL 與相同 token 填入本機 `firmware/main/secrets.h`。
 
-## 契約
+## API 資料格式
 
-Request 只有 `device_token` 與 `session`。Session 固定包含：
+請求只包含 `device_token` 與 `session`。`session` 固定包含：
 
 `session_id`、`chip_id`、`cat_id`、`enter_time`、`exit_time`、`duration_sec`、`min_distance_mm`、`avg_distance_mm`、`sample_count`。
 
-後端會驗證欄位名稱、型別與範圍、request 大小、timestamp 與 duration 一致性、device token，以及重複 `session_id`；Sheet 寫入使用 Script Lock。
+後端會驗證欄位名稱、型別與範圍、請求大小、時間戳記與停留時間的一致性、`DEVICE_TOKEN`，以及重複的 `session_id`；寫入 Sheet 時使用 Script Lock。
 
-`enter_time`、`exit_time` 使用 UTC ISO timestamp；`duration_sec` 是整數秒；`sample_count` 是該次事件取得的有效 VL53L0X 距離取樣數。
+`enter_time`、`exit_time` 使用 UTC ISO 時間戳記；`duration_sec` 是整數秒；`sample_count` 是該次事件取得的有效 VL53L0X 距離取樣數。
 
 正常回應為 `{"ok":true}`；相同 `session_id` 重送時回 `{"ok":true,"duplicate":true}`。失敗時回 `ok: false` 與錯誤碼。
 
@@ -80,7 +80,7 @@ Request 只有 `device_token` 與 `session`。Session 固定包含：
 
 `紀錄編號` · `晶片編號` · `貓咪` · `進入時間` · `離開時間` · `停留時間` · `最短距離（mm）` · `平均距離（mm）` · `取樣次數`
 
-時間寫成 Sheet 原生日期時間值；停留時間寫成 duration serial（`秒數 / 86400`）。後端不修改試算表地區、時區或顯示格式。
+時間寫成 Google Sheets 原生日期時間值；停留時間寫成可格式化的時間長度數值（`秒數 / 86400`）。後端不修改試算表的地區、時區或顯示格式。
 
 建議顯示設定：
 
@@ -92,7 +92,7 @@ Request 只有 `device_token` 與 `session`。Session 固定包含：
 
 在 Apps Script 編輯器執行 `doTest()`，會透過與裝置相同的 `doPost()` 路徑寫入一筆 `TEST` 紀錄。
 
-在 repository root 執行：
+在專案根目錄執行：
 
 ```sh
 node --test backend/tests/code.test.cjs
@@ -100,4 +100,4 @@ node --test backend/tests/code.test.cjs
 
 修改 `Code.gs` 後重新部署 Web App 新版本即可，既有 `/exec` URL 可維持不變。
 
-`DEVICE_TOKEN` 是 bearer secret；裝置或韌體外洩時應更換 token 並重新燒錄裝置。
+`DEVICE_TOKEN` 持有即具存取權限，應視為機密；裝置遺失或韌體外洩時應更換 token 並重新燒錄裝置。

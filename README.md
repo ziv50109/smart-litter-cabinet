@@ -2,9 +2,9 @@
 
 [繁體中文版](README.zh-TW.md)
 
-A litter-cabinet visit monitor built around the Seeed Studio XIAO ESP32-S3. The production path combines VL53L0X distance sensing, XY-134.2K RFID identification, and Google Apps Script/Sheets.
+A litter-cabinet visit monitor built around the Seeed Studio XIAO ESP32-S3. The main system uses VL53L0X distance sensing for doorway detection, XY-134.2K RFID for cat identification, and Google Apps Script/Sheets for visit records.
 
-Camera-based recognition is kept under `experiments/vision/` as an archived experiment and is not part of the current visit-detection path.
+Camera-based recognition remains under `experiments/vision/` as an archived experiment and does not participate in the current visit-detection flow.
 
 ## How it works
 
@@ -13,16 +13,16 @@ flowchart TD
     Power[Battery → MT3608 5V → XIAO ESP32-S3] --> Sensors[VL53L0X distance + XY-134.2K RFID]
     Sensors -->|Distance < 200 mm| Entry[Start provisional visit + RFID scan]
     Entry -->|Doorway clear for at least 250 ms| Armed[Arm exit detection]
-    Armed -->|Next distance < 200 mm| Exit[Mark exit + RFID scan if needed]
-    Exit -->|Clear for at least 1 s and RFID scan finished| Resolve[Resolve normal visit]
-    Entry -->|No confirmed exit by 5 min| Diagnostic[Diagnostics only]
+    Armed -->|Next distance < 200 mm| Exit[Create exit candidate + RFID scan if needed]
+    Exit -->|Doorway clear for at least 1 s and RFID scan finished| Resolve[Complete normal visit]
+    Entry -->|No confirmed exit by 5 min| Diagnostic[Keep diagnostics only]
     Exit -->|Still unresolved at 5 min 10 s| Diagnostic
     Resolve -->|Registered identity and no conflict| Queue[Persist pending record]
     Resolve -->|No registered identity or identity conflict| Diagnostic
     Queue --> Sheets[Background HTTPS → Google Sheets]
 ```
 
-The recorded duration is the interval between the first doorway blockage and the blockage that marks the exit. RFID and network wait time are not added to the visit duration.
+The recorded duration is the interval between the first doorway blockage and the second blockage that creates the exit candidate. RFID and network wait time are not added to the visit duration.
 
 ## Structure
 
@@ -39,7 +39,7 @@ The recorded duration is the interval between the first doorway blockage and the
 - Only normal visits with one registered identity and no identity conflict are uploaded. Timeout or unresolved visits remain in diagnostics and are not written to Sheets.
 - The firmware opens a maintenance window at boot and after each event for status, diagnostics, pending uploads, and Web OTA.
 - A 130 mm RFID coil has read the implanted 2×12 mm FDX-B tags at approximately 10–13 cm in the installed test environment.
-- Physical visit accuracy and battery life still depend on the final cabinet geometry, tag orientation, RF environment, and power supply.
+- Visit-detection accuracy, RFID read rate, and battery life depend on cabinet geometry, tag orientation, RF conditions, and power quality and should be verified on the installed hardware.
 
 ## Security
 
