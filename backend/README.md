@@ -9,17 +9,29 @@ The receiver accepts only `device_token` and `session` at the top level, with th
 
 ## Storage contract
 
-The backend and data sheet preserve source semantics instead of applying presentation formatting:
+The API contract remains UTC ISO timestamps plus integer seconds. Google Sheets stores the same semantics using Sheet-native numeric types so presentation can be controlled with normal Sheet formatting:
 
-- `enter_time` / `exit_time` stay UTC ISO strings exactly as accepted from the device, for example `2026-09-16T14:37:57Z`.
-- `duration_sec` stays integer seconds, for example `241`.
-- The display header is `停留時間`, but the stored value is still seconds.
-- The backend does not change the spreadsheet locale/time zone and does not apply date/time or duration number formats.
-- Presentation such as Taiwan local time or `mm:ss` belongs in a separate Sheet view/formula or application UI.
+- `enter_time` / `exit_time`: API receives UTC ISO strings such as `2026-09-16T14:37:57Z`; the Sheet stores the same instant as a real date/time value.
+- `duration_sec`: API receives integer seconds such as `81`; the Sheet stores the equivalent duration serial (`81 / 86400`).
+- The display header is `停留時間`.
+- The backend does **not** change the spreadsheet locale or time zone.
+- The backend does **not** apply number/date formats. Configure display formatting in Google Sheets itself.
 
-For compatibility, an exact old English protocol header row or the previous Chinese header row using `停留秒數` is renamed to the current Chinese display headers. Existing data cells are not converted.
+Recommended Sheet settings:
+
+- Spreadsheet time zone: your desired display zone, e.g. `(GMT+08:00) Taipei`.
+- Columns D:E (`進入時間`, `離開時間`): custom date/time format such as `yyyy/MM/dd HH:mm:ss`.
+- Column F (`停留時間`): custom number format `[mm]:ss` so 81 seconds displays as `01:21`.
+
+Changing the spreadsheet time zone changes how D:E are displayed because they are real timestamps. It does not change duration semantics in F.
+
+For compatibility, an exact old English protocol header row or the previous Chinese header row using `停留秒數` is renamed to the current Chinese display headers. Existing historical data cells are not automatically converted; if an older deployment already wrote strings or raw seconds, correct those rows separately before applying one format to the entire column.
 
 `sample_count` is the number of valid VL53L0X distance samples collected during the session.
+
+## Manual Apps Script smoke test
+
+Run `testWriteSample_()` from the Apps Script editor. It writes one clearly marked `TEST` row through the same `doPost()` path, using the configured `DEVICE_TOKEN` and a unique test `session_id`.
 
 After changing `Code.gs`, create a new Web App deployment version (Deploy → Manage deployments → Edit → New version → Deploy). The existing `/exec` URL can remain unchanged.
 
@@ -40,17 +52,29 @@ The ESP32 token is a bearer secret and can be recovered by someone with physical
 
 ## 儲存契約
 
-後端與資料表只保存 source 語意，不處理顯示格式：
+API contract 仍維持 UTC ISO timestamp 與整數秒；Google Sheets 則使用 Sheet 原生可格式化的數值型別保存相同語意：
 
-- `enter_time` / `exit_time` 保持裝置送來且驗證通過的 UTC ISO 字串，例如 `2026-09-16T14:37:57Z`。
-- `duration_sec` 保持整數秒，例如 `241`。
-- Sheet 顯示欄名使用較中性的「停留時間」，但儲存值仍然是秒數。
-- 後端不修改試算表的地區／時區，也不套用日期時間或 duration 格式。
-- 台灣時間、`mm:ss` 等呈現方式應由另一個 Sheet View／公式或真正的前端 UI 處理。
+- `enter_time` / `exit_time`：API 接收 `2026-09-16T14:37:57Z` 這類 UTC ISO 字串；Sheet 寫入代表同一個時間點的真正日期時間值。
+- `duration_sec`：API 仍接收整數秒，例如 `81`；Sheet 寫入等價的 duration serial，也就是 `81 / 86400`。
+- Sheet 顯示欄名使用「停留時間」。
+- 後端**不修改**試算表的地區或時區。
+- 後端**不套用**日期時間或 duration 顯示格式；顯示方式由 Google Sheets 自己設定。
 
-為了相容既有 Sheet，若表頭完整符合舊英文 protocol 欄名，或只差第六欄仍為「停留秒數」的舊中文表頭，後端只會把表頭改成目前中文顯示名稱；**既有資料值不做任何換算**。
+建議 Google Sheet 設定：
+
+- 試算表時區：依你希望的顯示時區，例如 `(GMT+08:00) 台北`。
+- D:E 欄（進入時間／離開時間）：自訂日期時間格式 `yyyy/MM/dd HH:mm:ss`。
+- F 欄（停留時間）：自訂數字格式 `[mm]:ss`，因此 81 秒會顯示為 `01:21`。
+
+更改試算表時區後，D:E 的顯示會跟著變，因為它們是真正的 timestamp；F 是 duration，不受時區影響。
+
+為了相容既有 Sheet，若表頭完整符合舊英文 protocol 欄名，或只差第六欄仍為「停留秒數」的舊中文表頭，後端只會改成目前中文表頭。**既有歷史資料不會自動轉型**；如果舊版本已寫入 ISO 字串或整數秒，請先另外修正那些舊列，再對整欄套統一格式。
 
 `sample_count` 代表該次 session 期間取得的有效 VL53L0X 距離取樣數。
+
+## Apps Script 手動測試
+
+在 Apps Script 編輯器直接執行 `testWriteSample_()`。它會使用 Script Properties 裡的 `DEVICE_TOKEN`，透過與 ESP32 相同的 `doPost()` 路徑寫入一筆清楚標示為 `TEST` 的測試資料，並產生唯一的 test `session_id`。
 
 修改 `Code.gs` 後，需要到「部署 → 管理部署作業 → 編輯 → 建立新版本 → 部署」。原本的 `/exec` URL 可以維持不變。
 
@@ -66,4 +90,4 @@ From the repository root:
 node --test backend/tests/code.test.cjs
 ```
 
-The tests verify that accepted UTC strings and integer seconds are stored without presentation conversion, legacy headers are renamed without touching existing data, duplicates remain idempotent, and validation/security guards still work.
+The tests verify Sheet-native timestamp/duration storage, no backend time-zone/number-format mutation, header compatibility, duplicate idempotency, validation/security guards, and the manual smoke-test helper.
