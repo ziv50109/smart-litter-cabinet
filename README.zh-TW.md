@@ -11,18 +11,18 @@
 ```mermaid
 flowchart TD
     Power[鋰電池 → MT3608 5V → XIAO ESP32-S3] --> Sensors[VL53L0X 距離 + XY-134.2K RFID]
-    Sensors -->|距離 < 200 mm| Entry[建立暫定事件 + RFID 掃描]
-    Entry -->|入口持續無遮擋至少 250 ms| Armed[允許判定離開]
-    Armed -->|下一次距離 < 200 mm| Exit[建立離開候選 + 必要時 RFID 掃描]
-    Exit -->|入口持續無遮擋至少 1 秒且 RFID 掃描結束| Resolve[完成正常事件]
-    Entry -->|5 分鐘仍無法確認離開| Diagnostic[僅保留診斷資料]
-    Exit -->|5 分 10 秒仍未完成| Diagnostic
+    Sensors -->|入口由無遮擋轉為遮擋| Entry[建立暫定事件 + RFID 掃描]
+    Entry -->|無遮擋時間達到離開判定條件| Armed[允許判定離開]
+    Armed -->|入口再次由無遮擋轉為遮擋| Exit[建立離開候選 + 必要時 RFID 掃描]
+    Exit -->|無遮擋確認完成且 RFID 掃描結束| Resolve[完成正常事件]
+    Entry -->|逾時仍無法確認離開| Diagnostic[僅保留診斷資料]
+    Exit -->|最終期限前仍未完成| Diagnostic
     Resolve -->|有已登錄身分且無衝突| Queue[保存待傳紀錄]
     Resolve -->|沒有已登錄身分或身分衝突| Diagnostic
     Queue --> Sheets[背景 HTTPS → Google Sheets]
 ```
 
-停留時間以「第一次入口遮擋」到「建立離開候選的第二次遮擋」計算，不包含 RFID 或網路等待時間。
+正式韌體的門檻與時間參數統一定義在 `firmware/main/app_config.h`，README 不重複目前數值。停留時間以第一次入口遮擋到建立離開候選的第二次遮擋計算，不包含 RFID 或網路等待時間。
 
 ## 目錄
 
@@ -34,10 +34,10 @@ flowchart TD
 
 ## 目前行為
 
-- 待機時 VL53L0X 每 200 ms 測距，事件期間每 100 ms 測距。
-- RFID 只在掃描期間供電；讀到已登錄晶片或 10 秒掃描逾時即關閉。
+- VL53L0X 的待機與事件中測距週期由 `app_config.h` 分別定義。
+- RFID 只在掃描期間供電；讀到已登錄晶片或達到設定的掃描逾時即關閉。
 - 只有正常離開、辨識到單一已登錄貓咪且沒有身分衝突的事件會上傳。逾時或無法確定身分的事件僅保留診斷資料，不寫入 Google Sheets。
-- 開機與每次事件結束後會進入限時維護模式，提供狀態、診斷、待傳資料上傳與 Web OTA。
+- 開機與每次事件結束後會依設定進入維護模式，提供狀態、診斷、待傳資料上傳與 Web OTA。
 - 130 mm 線圈在目前安裝測試環境中，讀取皮下 2×12 mm FDX-B 晶片的實測距離約 10–13 cm。
 - 進出判定準確度、RFID 讀取率與續航會受櫃體結構、晶片方向、RF 環境及供電影響，應以實機測試結果為準。
 
