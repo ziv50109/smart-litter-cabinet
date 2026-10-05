@@ -51,6 +51,10 @@ function createHarness(initialRows = []) {
       rows.push([...values]);
       return sheet;
     },
+    insertRowBefore(rowNumber) {
+      rows.splice(rowNumber - 1, 0, []);
+      return sheet;
+    },
     getRange(row, col, rowCount = 1, colCount = 1) {
       const zeroRow = row - 1;
       const zeroCol = col - 1;
@@ -154,7 +158,7 @@ function createHarness(initialRows = []) {
   };
 }
 
-test('stores native values and formats timestamps and duration on the appended row', () => {
+test('stores native values and formats timestamps and duration on the newest row', () => {
   const h = createHarness();
   const session = fixture();
 
@@ -191,10 +195,11 @@ test('renames previous Chinese header only and leaves existing data untouched', 
 
   assert.deepEqual(h.post(fixture({ session_id: 'session-new' })), { ok: true });
   assert.deepEqual(h.rows[0], HEADERS);
-  assert.deepEqual(h.rows[1], existing);
+  assert.equal(h.rows[1][0], 'session-new');
+  assert.deepEqual(h.rows[2], existing);
   assert.deepEqual(h.numberFormatWrites, [
-    { row: 3, col: 4, rowCount: 1, colCount: 2, format: 'yyyy/MM/dd HH:mm:ss' },
-    { row: 3, col: 6, rowCount: 1, colCount: 1, format: '[m]:ss' },
+    { row: 2, col: 4, rowCount: 1, colCount: 2, format: 'yyyy/MM/dd HH:mm:ss' },
+    { row: 2, col: 6, rowCount: 1, colCount: 1, format: '[m]:ss' },
   ]);
 });
 
@@ -205,7 +210,19 @@ test('renames legacy English header only and leaves existing data untouched', ()
 
   assert.deepEqual(h.post(fixture({ session_id: 'session-new' })), { ok: true });
   assert.deepEqual(h.rows[0], HEADERS);
-  assert.deepEqual(h.rows[1], existing);
+  assert.equal(h.rows[1][0], 'session-new');
+  assert.deepEqual(h.rows[2], existing);
+});
+
+test('inserts each new session directly below the header', () => {
+  const h = createHarness();
+
+  assert.deepEqual(h.post(fixture({ session_id: 'session-old' })), { ok: true });
+  assert.deepEqual(h.post(fixture({ session_id: 'session-new' })), { ok: true });
+
+  assert.deepEqual(h.rows[0], HEADERS);
+  assert.equal(h.rows[1][0], 'session-new');
+  assert.equal(h.rows[2][0], 'session-old');
 });
 
 test('duplicate session is idempotent and does not rewrite data or formats', () => {
