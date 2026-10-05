@@ -185,8 +185,10 @@ function doPost(e) {
           return jsonResponse_({ok: true, duplicate: true});
         }
       }
-      sheet.appendRow(FIELD_KEYS.map(key => sheetValue_(key, row[key])));
-      formatRow_(sheet, sheet.getLastRow());
+      sheet.insertRowBefore(2);
+      sheet.getRange(2, 1, 1, FIELD_KEYS.length)
+        .setValues([FIELD_KEYS.map(key => sheetValue_(key, row[key]))]);
+      formatRow_(sheet, 2);
     } finally {
       lock.releaseLock();
     }
