@@ -52,19 +52,54 @@ inline bool queueHeadUnrecoverable(const char *enterTime, const char *exitTime, 
 }
 
 struct Window {
-  uint32_t started = 0, duration = 0;
-  void open(uint32_t now, uint32_t ms) { started = now; duration = ms; }
+  uint64_t started = 0;
+  uint32_t duration = 0;
+  void open(uint64_t now, uint32_t ms) { started = now; duration = ms; }
   void close() { duration = 0; }
-  bool active(uint32_t now) const { return duration && uint32_t(now - started) < duration; }
+  bool active(uint64_t now) const { return duration && now - started < duration; }
+  uint32_t remaining(uint64_t now) const { return active(now) ? duration - uint32_t(now - started) : 0; }
 };
 struct Backoff {
-  uint32_t failedAt = 0, delayMs = 0;
-  bool ready(uint32_t now) const { return !delayMs || uint32_t(now - failedAt) >= delayMs; }
+  uint64_t failedAt = 0;
+  uint32_t delayMs = 0;
+  bool ready(uint64_t now) const { return !delayMs || now - failedAt >= delayMs; }
+  uint32_t remaining(uint64_t now) const { return ready(now) ? 0 : delayMs - uint32_t(now - failedAt); }
   void reset() { delayMs = 0; }
-  void fail(uint32_t now, uint32_t initial, uint32_t maximum) {
+  void fail(uint64_t now, uint32_t initial, uint32_t maximum) {
     failedAt = now;
     delayMs = !delayMs ? initial : (delayMs >= maximum / 2 ? maximum : delayMs * 2);
     if (delayMs > maximum) delayMs = maximum;
+  }
+};
+
+inline uint32_t networkWaitMs(bool online, bool permanentWanted, const Window &window,
+                              const Backoff &backoff, uint64_t now, uint32_t pollMs) {
+  if (online) return pollMs;
+  if (!permanentWanted && !window.active(now)) return UINT32_MAX;
+  const uint32_t retry = backoff.remaining(now);
+  if (!permanentWanted && window.remaining(now) < retry) return window.remaining(now);
+  return retry;
+}
+
+struct OnTime {
+  uint64_t accumulatedUs = 0, startedUs = 0;
+  bool enabled = false;
+  void set(bool on, uint64_t nowUs) {
+    if (on == enabled) return;
+    if (on) startedUs = nowUs;
+    else accumulatedUs += nowUs - startedUs;
+    enabled = on;
+  }
+  uint64_t elapsedUs(uint64_t nowUs) const {
+    return accumulatedUs + (enabled ? nowUs - startedUs : 0);
+  }
+};
+struct BootPowerStats {
+  OnTime rfid, wifi;
+  uint64_t rfidScans = 0, manualSleepUs = 0, manualSleepCalls = 0, manualSleepErrors = 0;
+  void recordSleep(bool success, uint64_t elapsedUs) {
+    if (success) { ++manualSleepCalls; manualSleepUs += elapsedUs; }
+    else ++manualSleepErrors;
   }
 };
 

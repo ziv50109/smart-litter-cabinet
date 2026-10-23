@@ -19,6 +19,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/queue.h>
+#include <freertos/task.h>
 #include <esp_pm.h>
 #include <esp_wifi.h>
 #include <esp_ota_ops.h>
@@ -54,7 +55,7 @@
 #define LITTER_CONNECTED_STANDBY 0
 #endif
 
-static const char *FW_VERSION = "main-2026-09-17";
+static const char *FW_VERSION = "main-2026-10-23";
 
 struct ScopedLock {
   SemaphoreHandle_t handle;
@@ -67,6 +68,7 @@ struct ScopedLock {
 };
 SemaphoreHandle_t sensorMutex, queueMutex, diagMutex, logMutex, powerGate;
 QueueHandle_t freeDiagnostics, readyDiagnostics;
+TaskHandle_t networkTaskHandle = nullptr;
 std::atomic<uint32_t> maintenanceRequest{0};
 std::atomic<bool> otaPaused{false};
 std::atomic<bool> connectedStandby{false};
@@ -122,6 +124,7 @@ Preferences queuePrefs, diagPrefs;
 WebServer web(80);
 Visit::Engine visit;
 SessionMetrics metrics;
+Runtime::BootPowerStats bootPowerStats; // Sensor fields use sensorMutex; Wi-Fi belongs to networkTask.
 
 bool tofReady = false;
 bool rfidPower = false;
@@ -166,7 +169,6 @@ String jsonEscape(const String &s) {
   }
   return out;
 }
-
 String catForChip(const String &chip) {
   if (CAT_1_CHIP_RAW[0] && chip == CAT_1_CHIP_RAW) return CAT_1_NAME;
   if (CAT_2_CHIP_RAW[0] && chip == CAT_2_CHIP_RAW) return CAT_2_NAME;
@@ -199,6 +201,7 @@ void rfidSet(bool on) {
   }
 #endif
   digitalWrite(Config::RFID_ENABLE_PIN, on ? HIGH : LOW);
+  bootPowerStats.rfid.set(on, uint64_t(esp_timer_get_time()));
   if (on) { rfidPowerAt = now; traceEvent(1); }
   else {
     if (metrics.open) {
@@ -240,6 +243,7 @@ bool parseRfid(const String &frame, String &chip) {
 void syncRfidPower() {
   if (visit.scanGeneration != seenScanGeneration) {
     seenScanGeneration = visit.scanGeneration;
+    ++bootPowerStats.rfidScans;
     rfidFirstByte = false;
     rfidReceiving = false;
     rfidFrame = "";
@@ -494,6 +498,7 @@ bool connectSta(uint32_t timeoutMs) {
   if (!strlen(WIFI_SSID)) return false;
   WiFi.persistent(false);
   WiFi.setAutoReconnect(false); // Retry policy is bounded and owned by networkTask.
+  bootPowerStats.wifi.set(true, uint64_t(esp_timer_get_time()));
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   uint32_t started = millis();
@@ -508,6 +513,7 @@ bool connectSta(uint32_t timeoutMs) {
     return true;
   }
   WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF); netMode.store(NetMode::Off);
+  bootPowerStats.wifi.set(false, uint64_t(esp_timer_get_time()));
   return false;
 }
 void syncClock() {
@@ -651,6 +657,7 @@ void finishSession() {
   logLive("session_end", String(Visit::reasonName(visit.reason)) + " " + String(duration) + "ms");
   visit.release(); metrics.open = false; traceReset();
   maintenanceRequest.store(Config::POST_EVENT_MAINTENANCE_MS);
+  if (networkTaskHandle) xTaskNotifyGive(networkTaskHandle);
 }
 
 void processSensor() {
@@ -693,7 +700,7 @@ void setup() {
   configurePower();
   Serial.print("Power initialization: "); Serial.println(powerReason.load());
   maintenanceRequest.store(Config::BOOT_MAINTENANCE_MS);
-  if (xTaskCreate(networkTask, "litter-net", 12288, nullptr, 1, nullptr) != pdPASS) {
+  if (xTaskCreate(networkTask, "litter-net", 12288, nullptr, 1, &networkTaskHandle) != pdPASS) {
     connectedStandby.store(false);
     powerReason.store("network_task_init_failed");
     logLive("network_disabled", "task allocation failed");

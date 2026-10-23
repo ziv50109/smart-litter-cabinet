@@ -28,17 +28,18 @@ int main() {
 
   Window w;
   assert(!w.active(0));
-  w.open(UINT32_MAX - 10, 20);
-  assert(w.active(0)); assert(w.active(8)); assert(!w.active(9));
+  const uint64_t epoch = uint64_t(UINT32_MAX) - 10;
+  w.open(epoch, 20);
+  assert(w.active(epoch + 11)); assert(w.active(epoch + 19)); assert(!w.active(epoch + 20));
   w.close(); assert(!w.active(UINT32_MAX));
   Backoff b;
   assert(b.ready(0));
-  b.fail(UINT32_MAX - 10, 20, 80);
-  assert(!b.ready(8)); assert(b.ready(9));
-  b.fail(10, 20, 80); assert(b.delayMs == 40);
-  b.fail(50, 20, 80); assert(b.delayMs == 80);
-  b.fail(130, 20, 80); assert(b.delayMs == 80);
-  b.reset(); assert(b.ready(130));
+  b.fail(epoch, 20, 80);
+  assert(!b.ready(epoch + 19)); assert(b.ready(epoch + 20));
+  b.fail(epoch + 21, 20, 80); assert(b.delayMs == 40);
+  b.fail(epoch + 61, 20, 80); assert(b.delayMs == 80);
+  b.fail(epoch + 141, 20, 80); assert(b.delayMs == 80);
+  b.reset(); assert(b.ready(epoch + 141));
 
   OtaTransfer t;
   assert(!t.begin(1, false, true, 100, 1000));

@@ -44,8 +44,10 @@ void maybeSleep() {
   const int64_t before = esp_timer_get_time();
   const esp_err_t timer = esp_sleep_enable_timer_wakeup(uint64_t(ms) * 1000ULL);
   const esp_err_t result = timer == ESP_OK ? esp_light_sleep_start() : timer;
+  const uint64_t elapsedUs = uint64_t(esp_timer_get_time() - before);
+  bootPowerStats.recordSleep(result == ESP_OK, elapsedUs);
   if (metrics.open) {
-    if (result == ESP_OK) { ++metrics.sleepCalls; metrics.sleepMs += uint32_t((esp_timer_get_time() - before) / 1000); }
+    if (result == ESP_OK) { ++metrics.sleepCalls; metrics.sleepMs += uint32_t(elapsedUs / 1000); }
     else ++metrics.sleepErrors;
   }
 }
