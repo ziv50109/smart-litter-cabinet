@@ -93,6 +93,15 @@ String statusJson() {
     j += ",\"rfid_on\":" + String(rfidPower ? "true" : "false");
     j += ",\"global_max_gap_ms\":" + String(globalMaxGap);
     j += ",\"diagnostics_dropped\":" + String(diagnosticsDropped);
+    const uint64_t nowUs = uint64_t(esp_timer_get_time());
+    j += ",\"power_stats\":{\"boot_uptime_ms\":" + String(nowUs / 1000);
+    j += ",\"rfid_on_ms\":" + String(bootPowerStats.rfid.elapsedUs(nowUs) / 1000);
+    j += ",\"rfid_scans\":" + String(bootPowerStats.rfidScans);
+    j += ",\"wifi_enabled_ms\":" + String(bootPowerStats.wifi.elapsedUs(nowUs) / 1000);
+    j += ",\"sleep_ms\":" + String(bootPowerStats.manualSleepUs / 1000);
+    j += ",\"sleep_calls\":" + String(bootPowerStats.manualSleepCalls);
+    j += ",\"sleep_errors\":" + String(bootPowerStats.manualSleepErrors);
+    j += ",\"sleep_accounting\":\"manual_only\"}";
   }
   j += ",\"pending\":" + String(pendingCount());
   j += ",\"network\":\"" + String(netMode.load() == NetMode::Sta ? "sta" : "off") + "\"";
@@ -400,26 +409,28 @@ void stopNetwork() {
   if (webRunning) { web.stop(); webRunning = false; }
   cleanupOta(); csrfToken = ""; nonceIssued = false;
   WiFi.disconnect(true, false); WiFi.mode(WIFI_OFF); netMode.store(NetMode::Off);
+  bootPowerStats.wifi.set(false, uint64_t(esp_timer_get_time()));
 }
 void networkTask(void *) {
   uint32_t lastUpload = 0;
   bool uploadRequested = true;
   for (;;) {
+    uint32_t waitMs = Config::NETWORK_POLL_MS;
     {
       // Serializes transitions against OFF-mode manual sleep, not against sampling.
       ScopedLock power(powerGate);
       const uint32_t request = maintenanceRequest.exchange(0);
-      if (request) { maintenanceWindow.open(millis(), request); uploadRequested = true; }
+      if (request) { maintenanceWindow.open(uint64_t(esp_timer_get_time() / 1000), request); uploadRequested = true; }
       uint8_t diagnostic = 0;
-      if (xQueueReceive(readyDiagnostics, &diagnostic, 0) == pdTRUE) {
+      while (xQueueReceive(readyDiagnostics, &diagnostic, 0) == pdTRUE) {
         saveDiagnostics(diagnosticSnapshots[diagnostic]);
         xQueueSend(freeDiagnostics, &diagnostic, 0);
       }
-      const bool wanted = connectedStandby.load() || (maintenanceSticky && adminConfigured()) || maintenanceWindow.active(millis());
+      const bool wanted = connectedStandby.load() || (maintenanceSticky && adminConfigured()) || maintenanceWindow.active(uint64_t(esp_timer_get_time() / 1000));
       if (netMode.load() == NetMode::Sta && WiFi.status() != WL_CONNECTED) {
-        stopNetwork(); reconnectBackoff.fail(millis(), Config::NETWORK_RETRY_INITIAL_MS, Config::NETWORK_RETRY_MAX_MS);
+        stopNetwork(); reconnectBackoff.fail(uint64_t(esp_timer_get_time() / 1000), Config::NETWORK_RETRY_INITIAL_MS, Config::NETWORK_RETRY_MAX_MS);
       }
-      if (wanted && netMode.load() == NetMode::Off && reconnectBackoff.ready(millis())) {
+      if (wanted && netMode.load() == NetMode::Off && reconnectBackoff.ready(uint64_t(esp_timer_get_time() / 1000))) {
         if (connectSta(Config::WIFI_TIMEOUT_MS)) {
           reconnectBackoff.reset();
           if (adminConfigured()) {
@@ -429,11 +440,11 @@ void networkTask(void *) {
             Serial.print("Management URL: http://"); Serial.println(WiFi.localIP());
           } else logLive("web_disabled", "set independent admin credentials");
           uploadRequested = true;
-        } else reconnectBackoff.fail(millis(), Config::NETWORK_RETRY_INITIAL_MS, Config::NETWORK_RETRY_MAX_MS);
+        } else reconnectBackoff.fail(uint64_t(esp_timer_get_time() / 1000), Config::NETWORK_RETRY_INITIAL_MS, Config::NETWORK_RETRY_MAX_MS);
       }
       if (webRunning) web.handleClient();
       if (otaRequestOpen && (otaTransfer.expired(millis(), Config::OTA_DEADLINE_MS) || !web.client().connected())) cleanupOta();
-      const bool keepNetwork = connectedStandby.load() || (maintenanceSticky && adminConfigured()) || maintenanceWindow.active(millis());
+      const bool keepNetwork = connectedStandby.load() || (maintenanceSticky && adminConfigured()) || maintenanceWindow.active(uint64_t(esp_timer_get_time() / 1000));
       if (!keepNetwork && !otaRequestOpen && netMode.load() != NetMode::Off) stopNetwork();
       if (!otaRequestOpen && netMode.load() == NetMode::Sta &&
           (uploadRequested || uint32_t(millis() - lastUpload) >= Config::UPLOAD_RETRY_MS)) {
@@ -441,7 +452,15 @@ void networkTask(void *) {
         for (uint8_t skipped = 0; skipped < Config::MAX_PENDING_RECORDS && quarantineUnrecoverableQueueHead(); ++skipped) {}
         uploadPending(); // One recoverable record; service the management listener between uploads.
       }
+      const uint64_t now = uint64_t(esp_timer_get_time() / 1000);
+      if (!maintenanceWindow.active(now)) maintenanceWindow.close();
+      waitMs = Runtime::networkWaitMs(netMode.load() != NetMode::Off,
+        connectedStandby.load() || (maintenanceSticky && adminConfigured()),
+        maintenanceWindow, reconnectBackoff, now, Config::NETWORK_POLL_MS);
     }
-    delay(Config::NETWORK_POLL_MS);
+    // A notification arriving after the handoff remains pending until this wait.
+    const TickType_t waitTicks = waitMs == UINT32_MAX ? portMAX_DELAY :
+      (pdMS_TO_TICKS(waitMs) ? pdMS_TO_TICKS(waitMs) : 1);
+    ulTaskNotifyTake(pdTRUE, waitTicks);
   }
 }

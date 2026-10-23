@@ -44,7 +44,19 @@ Arduino loop 單獨擁有感測器、RFID、`visit` 與進行中的統計。另�
 
 連線模式要求有效管理帳密、真正啟用的 `CONFIG_PM_ENABLE`／`CONFIG_FREERTOS_USE_TICKLESS_IDLE`，以及成功的 PM 初始化。缺少能力會回到離線模式，並顯示 `requested_mode`、`effective_mode`、`power_init`；不以 sketch 的同名巨集假裝啟用了預編譯 SDK 功能。
 
-自動淺眠模式不呼叫手動睡眠／timer wakeup；RFID 收訊期間持有防淺眠及 APB 時鐘鎖，關閉 RFID 後釋放。網路 task 以有界輪詢間隔等待，感測 loop 按下一次取樣期限等待。`automatic_pm_configured` 只代表 API 設定成功，不代表已量到節電效果。
+自動淺眠模式不呼叫手動睡眠／timer wakeup；RFID 收訊期間持有防淺眠及 APB 時鐘鎖，關閉 RFID 後釋放。網路在線時，task 保留有界輪詢間隔以服務管理請求；Wi-Fi 關閉且沒有工作時，改為等待事件通知，需要重連時等到退避期限或維護窗口結束。事件完成會喚醒網路 task 處理診斷與維護請求，等待期間不持有電源鎖。感測 loop 仍按原有取樣期限等待。`automatic_pm_configured` 只代表 API 設定成功，不代表已量到節電效果。
+
+`/api/status` 的 `power_stats` 提供本次開機累積的省電診斷，存在 RAM，重新啟動後歸零，不額外寫入 Flash 或 Google Sheets：
+
+| 欄位 | 意義 |
+|---|---|
+| `boot_uptime_ms` | 本次開機經過時間 |
+| `rfid_on_ms`、`rfid_scans` | RFID 啟用接腳的命令開啟時間與掃描次數，包含進行中、辨識失敗及未上傳的事件 |
+| `wifi_enabled_ms` | Wi-Fi 啟用時間，包含連線嘗試及失敗等待，並非只有連線成功的時間 |
+| `sleep_ms`、`sleep_calls`、`sleep_errors` | 手動 Light-sleep 成功時間／次數與失敗次數，包含沒有事件的待機期間 |
+| `sleep_accounting` | 固定為 `manual_only`；不統計 SDK 自動淺眠 |
+
+上述時間使用 64 位元單調時鐘，不能視為實際電流或耗電量。核對節電效果時，用相同供電、模式及安裝條件比較修改前後的正式韌體，量測維護窗口結束後的待機與實際 RFID 掃描電流；同時確認取樣間隔、辨識、上傳、斷線重連及 OTA 行為。行動電源的輸出關閉也不一定代表電池電量已耗盡。
 
 `DEBUG_WEB_SERVER=true` 只保留除錯維護窗口，不能繞過帳密驗證或重新允許 AP。`/normal` 在離線模式關閉網路，在連線模式則保留監聽並結束本次管理操作。網頁在背景時停止狀態輪詢；未授權請求不延長維護窗口。
 
